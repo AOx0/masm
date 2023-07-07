@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use faerie::*;
 use nom::IResult;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::{
     fs::{File, OpenOptions},
@@ -9,65 +10,34 @@ use std::{
 };
 use target_lexicon::triple;
 
-fn generate_elf(out: File) -> Result<()> {
+fn parse_number(input: &str) -> Option<usize> {
+    // Attempt to parse hexadecimal representation
+    if input.starts_with("0x") {
+        usize::from_str_radix(&input[2..], 16).ok()
+    }
+    // Attempt to parse binary representation
+    else if input.starts_with("0b") {
+        usize::from_str_radix(&input[2..], 2).ok()
+    }
+    // Parse decimal representation
+    else {
+        usize::from_str(input).ok()
+    }
+}
+
+fn generate_elf(out: File, sections: &HashMap<&str, Fun<'_>>) -> Result<()> {
     let name = "test.o";
 
     let target = triple!("x86_64-unknown-unknown-elf");
     let mut obj = ArtifactBuilder::new(target).name(name.to_owned()).finish();
 
     obj.declarations(
-        [
-            ("end", Decl::function().into()),
-            ("_start", Decl::function().global().into()),
-            ("msg", Decl::cstring().into()),
-        ]
-        .iter()
-        .cloned(),
+        [("_start", Decl::function().global().into())]
+            .iter()
+            .cloned(),
     )?;
 
-    // 0000000000000000 <end>:
-    //    0:	48 c7 c0 3c 00 00 00 	mov    $0x3c,%rax
-    //    7:	48 c7 c7 00 00 00 00 	mov    $0x0,%rdi
-    //    e:	0f 05                	syscall
-    obj.define(
-        "end",
-        vec![
-            0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00,
-            0x0f, 0x05,
-        ],
-    )?;
-
-    // 0000000000000000 <_start>:
-    //    0:	48 c7 c0 01 00 00 00 	mov    $0x1,%rax
-    //    7:	48 c7 c7 01 00 00 00 	mov    $0x1,%rdi
-    //    e:	48 8d 35 00 00 00 00 	lea    0x0(%rip),%rsi        # 15 <_start+0x15>
-    //   15:	48 ba 0d 00 00 00 00 	movabs $0xd,%rdx
-    //   1c:	00 00 00
-    //   1f:	0f 05                	syscall
-    //   21:	e8 00 00 00 00       	call   26 <_start+0x26>
-    obj.define(
-        "_start",
-        vec![
-            0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00,
-            0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00, 0x48, 0xba, 0x0d, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x0f, 0x05, 0xe8, 0x00, 0x00, 0x00, 0x00,
-        ],
-    )?;
-
-    obj.define("msg", b"Hola Mundo!\n\0".to_vec())?;
-
-    // Next, we declare our relocations,
-    // which are _always_ relative to the `from` symbol
-    obj.link(Link {
-        from: "_start",
-        to: "msg",
-        at: 17,
-    })?;
-    obj.link(Link {
-        from: "_start",
-        to: "end",
-        at: 34,
-    })?;
+    obj.define("_start", sections["_start"].bytecode.clone())?;
 
     // Finally, we write the object file
     obj.write(out)?;
@@ -128,6 +98,7 @@ struct Fun<'a> {
     name: &'a str,
     instructions: Vec<&'a str>,
     references: Vec<Ref<'a>>,
+    bytecode: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -162,6 +133,51 @@ enum RegisterBits {
     Bit16(Register),
 }
 
+impl RegisterBits {
+    fn set_reg(&mut self, reg: Register) {
+        match self {
+            RegisterBits::Bit64(ref mut a) => {
+                *a = reg;
+            }
+            RegisterBits::Bit32(ref mut a) => {
+                *a = reg;
+            }
+            RegisterBits::Bit16(ref mut a) => {
+                *a = reg;
+            }
+        }
+    }
+
+    fn parse_reg(input: &str) -> Option<RegisterBits> {
+        let mut reg_bits = match input.chars().next()? {
+            'r' => RegisterBits::Bit64(Register::AX),
+            'e' => RegisterBits::Bit32(Register::AX),
+            'a' | 'c' | 'd' | 'b' | 's' => RegisterBits::Bit16(Register::AX),
+            _ => return None,
+        };
+
+        let kword = if matches!(reg_bits, RegisterBits::Bit64(_) | RegisterBits::Bit32(_)) {
+            1
+        } else {
+            0
+        };
+
+        reg_bits.set_reg(match &input[kword..] {
+            "ax" => Register::AX,
+            "cx" => Register::CX,
+            "dx" => Register::DX,
+            "bx" => Register::BX,
+            "sp" => Register::SP,
+            "bp" => Register::BP,
+            "si" => Register::SI,
+            "di" => Register::DI,
+            _ => unreachable!("Not implemented register {}", &input),
+        });
+
+        Some(reg_bits)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Either<U, V> {
     Left(U),
@@ -176,6 +192,58 @@ enum Imm {
     Bit64(u64),
 }
 
+impl Imm {
+    fn infer_from_reg_and_val(reg: RegisterBits, val: usize) -> Imm {
+        match reg {
+            RegisterBits::Bit64(_) => {
+                if val <= u32::MAX as usize {
+                    Imm::Bit32(0)
+                } else {
+                    Imm::Bit64(0)
+                }
+            }
+            RegisterBits::Bit32(_) => Imm::Bit32(0),
+            RegisterBits::Bit16(_) => Imm::Bit16(0),
+        }
+    }
+
+    fn set_val(&mut self, val: usize) -> Result<()> {
+        match self {
+            Imm::Bit64(ref mut pval) => {
+                if val <= u64::MAX as usize {
+                    *pval = val as u64
+                } else {
+                    return Err(anyhow!("Value {} bigger than 64 bit", val));
+                }
+            }
+            Imm::Bit32(ref mut pval) => {
+                if val <= u32::MAX as usize {
+                    *pval = val as u32
+                } else {
+                    return Err(anyhow!("Value {} bigger than 64 bit", val));
+                }
+            }
+            Imm::Bit16(ref mut pval) => {
+                if val <= u16::MAX as usize {
+                    *pval = val as u16
+                } else {
+                    return Err(anyhow!("Value {} bigger than 64 bit", val));
+                }
+            }
+            Imm::Bit8(ref mut pval) => {
+                if val <= u8::MAX as usize {
+                    *pval = val as u8
+                } else {
+                    return Err(anyhow!("Value {} bigger than 64 bit", val));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 struct Move {
     into: RegisterBits,
     value: Either<RegisterBits, Imm>,
@@ -187,6 +255,35 @@ enum Rex {
 }
 
 impl Move {
+    fn from_str(input: &str) -> Option<Move> {
+        if input.starts_with("mov ") {
+            let parts = input[4..].split(',').map(|f| f.trim()).collect::<Vec<_>>();
+
+            let first = parts.get(0)?;
+            let second = parts.get(1)?;
+            let dest = RegisterBits::parse_reg(&first)?;
+
+            if let Some(from) = RegisterBits::parse_reg(&second) {
+                Some(Move {
+                    into: dest,
+                    value: Either::Left(from),
+                })
+            } else {
+                let val = parse_number(&second)?;
+                let mut lmm = Imm::infer_from_reg_and_val(dest, val);
+
+                lmm.set_val(val).unwrap();
+
+                Some(Move {
+                    into: dest,
+                    value: Either::Right(lmm),
+                })
+            }
+        } else {
+            None
+        }
+    }
+
     fn into_bytes(&self) -> Vec<u8> {
         let mut result = Vec::with_capacity(5);
 
@@ -251,6 +348,7 @@ fn parse_section(input: &str) -> IResult<&str, Fun> {
         name,
         instructions: members,
         references: vec![],
+        bytecode: vec![],
     });
 
     delimited(space0, parse_segment, multispace0)(input)
@@ -280,8 +378,11 @@ fn main() -> Result<()> {
 
     println!("{script:?}");
 
-    let sections = get_segments(&script);
-    for mut section in sections {
+    let mut sections = get_segments(&script);
+    for ref mut section in sections.iter_mut() {
+        if section.name == "main" {
+            section.name = "_start"
+        }
         for (i, ins) in section.instructions.iter().enumerate() {
             if ins.contains('<') {
                 let reff = if ins.contains("call") {
@@ -297,19 +398,24 @@ fn main() -> Result<()> {
 
                 reff.map(|a| section.references.push(a));
             }
+
+            if ins.starts_with("mov") {
+                section
+                    .bytecode
+                    .extend_from_slice(&Move::from_str(ins).unwrap().into_bytes())
+            } else if ins.contains("syscall") {
+                section.bytecode.extend_from_slice(&[0xF, 0x5])
+            }
         }
 
         println!("Name: {}", section.name);
         println!("    {:?}", section.instructions);
         println!("    {:?}", section.references);
+        println!("    {:X?}", section.bytecode);
     }
 
-    let test = Move {
-        into: RegisterBits::Bit16(Register::CX),
-        value: Either::Left(RegisterBits::Bit16(Register::CX)),
-    };
+    let sections: HashMap<&str, Fun<'_>> =
+        HashMap::from_iter(sections.into_iter().map(|a| (a.name, a)));
 
-    println!("{:X?}", test.into_bytes());
-
-    generate_elf(out)
+    generate_elf(out, &sections)
 }
