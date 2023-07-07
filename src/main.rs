@@ -5,7 +5,7 @@
 //!       Combined Volumes: 1, 2A, 2B, 2C, 2D, 3A, 3B, 3C, 3D, and 4
 //!       At: https://cdrdv2.intel.com/v1/dl/getContent/671200
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use faerie::*;
 use nom::IResult;

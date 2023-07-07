@@ -1,6 +1,4 @@
-use super::*;
-use crate::{Fun, Ref};
-use faerie::Link;
+use crate::Ref;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Call<'a> {
