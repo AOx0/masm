@@ -5,7 +5,7 @@
 //!       Combined Volumes: 1, 2A, 2B, 2C, 2D, 3A, 3B, 3C, 3D, and 4
 //!       At: https://cdrdv2.intel.com/v1/dl/getContent/671200
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use faerie::*;
 use nom::IResult;
@@ -19,7 +19,11 @@ use target_lexicon::triple;
 
 mod bytecode;
 
-fn generate_elf(out: File, mut sections: HashMap<&str, Fun<'_>>) -> Result<()> {
+fn generate_elf(
+    out: File,
+    mut sections: HashMap<&str, Fun<'_>>,
+    mut data: Vec<Data<'_>>,
+) -> Result<()> {
     let name = "out.o";
 
     let target = triple!("x86_64-unknown-unknown-elf");
@@ -28,18 +32,25 @@ fn generate_elf(out: File, mut sections: HashMap<&str, Fun<'_>>) -> Result<()> {
     let (_, start) = sections
         .remove_entry("_start")
         .context("main or _start must be defined")?;
+
     obj.declarations(
         sections
             .iter()
             .map(|(name, _)| (name, Decl::function().into())),
     )?;
-    obj.declarations([("_start", Decl::function().global().into())].iter().cloned())?;
+    obj.declarations(
+        [("_start", Decl::function().global().into())]
+            .iter()
+            .cloned(),
+    )?;
+    obj.declarations(data.iter().map(|dat| (dat.name, Decl::data().into())))?;
 
     sections.iter_mut().try_for_each(|(name, sect)| {
-        obj.define(name, std::mem::replace(&mut sect.bytecode, vec![]))
+        obj.define(name, std::mem::replace(&mut sect.bytecode, Vec::new()))
     })?;
     obj.define("_start", start.bytecode)?;
-
+    data.iter_mut()
+        .try_for_each(|dat| obj.define(dat.name, std::mem::replace(&mut dat.values, Vec::new())))?;
     start
         .references
         .into_iter()
@@ -109,6 +120,93 @@ pub struct Ref<'a> {
     at: u64,
 }
 
+#[derive(Debug)]
+enum DataSize {
+    B1 = 0x1,
+    B2 = 0x2,
+    B4 = 0x4,
+    B8 = 0x8,
+    // ba = 0xA,
+}
+
+#[derive(Debug)]
+pub struct Data<'a> {
+    name: &'a str,
+    size: DataSize,
+    values: Vec<u8>,
+}
+
+impl<'a> Data<'a> {
+    fn from_str(input: &'a str) -> Result<Data<'a>> {
+        let (name, decl) = input
+            .split_once(':')
+            .map(|(name, decl)| (name.trim(), decl.trim()))
+            .context(anyhow!("Could not get name declaration NAME: DECL"))?;
+
+        let purp = match &decl[0..2] {
+            "db" => DataSize::B1,
+            "dw" => DataSize::B2,
+            "dd" => DataSize::B4,
+            "dq" => DataSize::B8,
+            // "dt" => DataSize::ba,
+            _ => return Err(anyhow!("Purpose {} is not valid", &decl[0..2])),
+        };
+
+        let mut values: Vec<u8> = vec![];
+
+        decl[2..]
+            .split(",")
+            .map(|val| val.trim())
+            .filter_map(|val| {
+                if val.is_empty() {
+                    None
+                } else if val.starts_with('\"') {
+                    Some(
+                        val.trim_matches('\"')
+                            .chars()
+                            .map(|c| format!("'{}'", c))
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    Some(vec![val.to_owned()])
+                }
+            })
+            .flatten()
+            .try_for_each(|val| {
+                let number = if val.starts_with('\'') {
+                    let c = val.trim_matches('\'');
+
+                    if c.len() == 1 {
+                        c.chars().next().context(anyhow!(""))? as usize
+                    } else {
+                        return Err(anyhow!(
+                            "Values starting with ' should be only chars. Ex: 'a'"
+                        ));
+                    }
+                } else {
+                    bytecode::parse_number(&val)
+                        .context(anyhow!("Failed to get number from {}", val))?
+                };
+
+                // TODO: Verificar que el dato si cabe en el objetivo
+                match purp {
+                    DataSize::B1 => values.extend(&(number as u8).to_le_bytes()),
+                    DataSize::B2 => values.extend(&(number as u16).to_le_bytes()),
+                    DataSize::B4 => values.extend(&(number as u32).to_le_bytes()),
+                    DataSize::B8 => values.extend(&(number as u64).to_le_bytes()),
+                };
+
+                Ok::<_, anyhow::Error>(())
+            })?;
+
+        Ok(Data {
+            name,
+            size: purp,
+            values,
+        })
+    }
+}
+
 impl<'a> Into<faerie::Link<'a>> for Ref<'a> {
     fn into(self) -> faerie::Link<'a> {
         Link {
@@ -176,11 +274,21 @@ fn main() -> Result<()> {
 
     println!("{script:?}");
 
+    let mut data = vec![];
     let mut sections = get_segments(&script);
     for ref mut section in sections.iter_mut() {
         if section.name == "main" {
             section.name = "_start"
         }
+
+        if section.name == "data" {
+            for ins in section.instructions.iter() {
+                let d = Data::from_str(ins).unwrap();
+                println!("{:X?}", d);
+                data.push(d);
+            }
+        }
+
         for ins in section.instructions.iter() {
             if ins.starts_with("mov ") {
                 section
@@ -205,5 +313,5 @@ fn main() -> Result<()> {
     let sections: HashMap<&str, Fun<'_>> =
         HashMap::from_iter(sections.into_iter().map(|a| (a.name, a)));
 
-    generate_elf(out, sections)
+    generate_elf(out, sections, data)
 }

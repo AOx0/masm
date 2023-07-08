@@ -6,6 +6,22 @@ use std::str::FromStr;
 pub mod call;
 pub mod mov;
 
+#[derive(Debug)]
+pub enum DataSize {
+    B1 = 0x1,
+    B2 = 0x2,
+    B4 = 0x4,
+    B8 = 0x8,
+    // ba = 0xA,
+}
+
+#[derive(Debug)]
+pub struct Data<'a> {
+    pub name: &'a str,
+    pub size: DataSize,
+    pub values: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Register {
     AX = 0b000,
@@ -77,7 +93,14 @@ enum Either<U, V> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Imm {
+enum Either3<U, V, W> {
+    Left(U),
+    Middle(V),
+    Right(W),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Imm {
     Bit8(u8),
     Bit16(u16),
     Bit32(u32),
@@ -94,6 +117,14 @@ impl Imm {
                     Imm::Bit64(0)
                 }
             }
+            RegisterBits::Bit32(_) => Imm::Bit32(0),
+            RegisterBits::Bit16(_) => Imm::Bit16(0),
+        }
+    }
+
+    fn infer_from_reg(reg: RegisterBits) -> Imm {
+        match reg {
+            RegisterBits::Bit64(_) => Imm::Bit64(0),
             RegisterBits::Bit32(_) => Imm::Bit32(0),
             RegisterBits::Bit16(_) => Imm::Bit16(0),
         }
