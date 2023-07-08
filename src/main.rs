@@ -120,22 +120,6 @@ pub struct Ref<'a> {
     at: u64,
 }
 
-#[derive(Debug)]
-enum DataSize {
-    B1 = 0x1,
-    B2 = 0x2,
-    B4 = 0x4,
-    B8 = 0x8,
-    // ba = 0xA,
-}
-
-#[derive(Debug)]
-pub struct Data<'a> {
-    name: &'a str,
-    size: DataSize,
-    values: Vec<u8>,
-}
-
 impl<'a> Data<'a> {
     fn from_str(input: &'a str) -> Result<Data<'a>> {
         let (name, decl) = input
