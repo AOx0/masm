@@ -6,7 +6,10 @@ msg2 db -1
 end:
 mov rax, rdi
 mov edi, eax
+mov  rax, [rcx] ;; sys_exit
+mov  [rcx], rax ;; sys_exit
 mov  rax, [rsi + rdi * 0x1 + 4] ;; sys_exit
+mov  [rsi + rdi * 0x1 + 4], rax ;; sys_exit
 mov  rax, [rsi + rdi + 4] ;; sys_exit
 mov  rax, [rcx + rdi + 4] ;; sys_exit
 mov  rax, [rcx + rdi + 4] ;; sys_exit

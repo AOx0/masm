@@ -1175,8 +1175,14 @@ impl Fun {
                             return Err(anyhow!("Error at line {}: MOV must have 2 operands", i));
                         }
 
-                        let op2 = operands.pop().unwrap();
-                        let op1 = operands.pop().unwrap();
+                        let mut op2 = operands.pop().unwrap();
+                        let mut op1 = operands.pop().unwrap();
+
+                        let reverse_direction = matches!(op2, Operand::Register(_))
+                            && matches!(op1, Operand::Memory(_));
+                        if reverse_direction {
+                            std::mem::swap(&mut op1, &mut op2)
+                        }
 
                         match (op1, op2) {
                             (Operand::Register(reg1), Operand::Register(reg2)) => {
@@ -1239,7 +1245,7 @@ impl Fun {
                                     extender.push(0x66);
                                 }
 
-                                extender.push(0x8B);
+                                extender.push(0x89 | if reverse_direction { 0b10 } else { 0b00 });
 
                                 let mut modrm = 0b00_000_000;
 
