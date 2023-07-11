@@ -20,7 +20,6 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use faerie::*;
-use num::Bounded;
 
 use target_lexicon::Triple;
 
@@ -1229,6 +1228,11 @@ impl Fun {
                             (Operand::Register(reg), Operand::Memory(mem)) => {
                                 let mut extender = vec![];
 
+                                let only_base = matches!(mem.displacement, None)
+                                    && matches!(mem.index, None)
+                                    && matches!(mem.scale, None)
+                                    && matches!(mem.base, Some(_));
+
                                 let mut sib: u8 = 0b00_000_000;
                                 if let Some(base) = mem.base {
                                     sib |= base.reg as u8;
@@ -1253,6 +1257,7 @@ impl Fun {
                                 modrm |= 0b00_000_100;
 
                                 let imm = if let Some(disp) = mem.displacement {
+                                    println!("Found disp: {:?}", disp);
                                     let imm = Immediate::from(disp);
                                     let imm = if let Ok(imm) = imm.into_imm(Bits::Bits8) {
                                         imm
@@ -1271,9 +1276,16 @@ impl Fun {
                                     Vec::new()
                                 };
 
+                                println!("Generating Mod: {:X}", modrm);
+                                println!("Generating SIB: {:X}", sib);
+                                println!("Generating IMM: {:X?}", imm);
+                                println!();
                                 extender.push(modrm);
                                 extender.push(sib);
-                                extender.extend_from_slice(&imm);
+
+                                if !only_base {
+                                    extender.extend_from_slice(&imm);
+                                }
                                 self.bytecode.extend_from_slice(&extender);
                             }
                             _ => {}
