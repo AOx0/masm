@@ -20,6 +20,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use faerie::*;
+use num::Bounded;
 
 use target_lexicon::Triple;
 
@@ -33,6 +34,18 @@ enum Bits {
     Bits64 = 64,
 }
 
+impl PartialEq<u8> for Bits {
+    fn eq(&self, other: &u8) -> bool {
+        *self as u8 == *other
+    }
+}
+
+impl From<Bits> for u8 {
+    fn from(bits: Bits) -> Self {
+        bits as u8
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Register {
     reg: RegisterName,
@@ -41,9 +54,7 @@ struct Register {
 
 impl From<Register> for u8 {
     fn from(register: Register) -> Self {
-        let reg = register.reg as u8;
-        let bits = register.bits as u8;
-        reg | bits
+        register.reg as u8
     }
 }
 
@@ -621,52 +632,84 @@ impl FromStr for Displacement {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+/// En caso de que se usen valores por default, se debe usar el valor de 101 como base (copia de rsp) y el valor de 100 como index (rsp)
+/// con escala de 0b00, efectivamente haciendo que no haya indexado adicional
+#[derive(Debug, Clone, Copy)]
 struct EffectiveAddress {
-    base: Option<Register>,
-    index: Option<Register>,
-    scale: Option<Scale>,
-    displacement: Option<Displacement>,
+    base: Register,
+    index: Register,
+    scale: Scale,
+    displacement: Displacement,
+    typ: EffectiveAddressType,
 }
 
-impl From<EffectiveAddress> for Vec<u8> {
-    fn from(value: EffectiveAddress) -> Self {
-        // Encode the ModR/M byte + SIB byte + displacement
-        let mut result = vec![];
-        let mut modrm = 0b00_000_000;
-        let mut sib = 0b00_000_100;
+impl EffectiveAddress {
+    fn into_vec(self, reg: Register) -> Result<Vec<u8>> {
+        let mem = self;
+        let only_base = matches!(mem.typ, EffectiveAddressType::OnlyBase);
+        let mut extender = vec![];
+        if only_base {
+            let mut modrm = 0b00_000_000;
+            modrm += u8::from(mem.base);
+            modrm += u8::from(reg) << 3;
+            extender.push(modrm);
+        } else {
+            let mut modrm = 0b00_000_100;
+            modrm += u8::from(reg) << 3;
 
-        // Encode the ModR/M byte
-        if let Some(base) = value.base {
-            modrm |= u8::from(base);
-        }
-        if let Some(index) = value.index {
-            modrm |= u8::from(index) << 3;
-        }
-        if let Some(displacement) = value.displacement {
-            modrm |= 0b01_000_000;
-            result.push(modrm);
-            result.extend_from_slice(&Vec::from(displacement));
-            return result;
+            let mut sib = 0b00_000_000;
+            sib += u8::from(mem.base);
+            sib += u8::from(mem.index) << 3;
+            sib += u8::from(mem.scale) << 6;
+
+            let mut imm = Immediate::from(mem.displacement).into_imm(Bits::Bits32)?;
+
+            if !matches!(mem.typ, EffectiveAddressType::OnlyDisplacement) {
+                imm = if let Ok(imm) = imm.into_imm(Bits::Bits8) {
+                    imm
+                } else {
+                    imm.into_imm(Bits::Bits32)?
+                };
+
+                modrm += if Bits::from(imm) as u8 == 8 {
+                    0b01_000_000
+                } else {
+                    0b10_000_000
+                };
+            }
+
+            extender.push(modrm);
+            extender.push(sib);
+            extender.extend_from_slice(&Vec::from(imm));
         }
 
-        // Encode the SIB byte
-        if let Some(scale) = value.scale {
-            sib |= u8::from(scale) << 6;
-        }
-        if let Some(index) = value.index {
-            sib |= u8::from(index) << 3;
-        }
-        if let Some(base) = value.base {
-            sib |= u8::from(base);
-        }
-        result.push(modrm);
-        result.push(sib);
-        if let Some(displacement) = value.displacement {
-            result.extend_from_slice(&Vec::from(displacement));
-        }
-        result
+        Ok(extender)
     }
+}
+
+impl Default for EffectiveAddress {
+    fn default() -> Self {
+        EffectiveAddress {
+            base: Register {
+                bits: Bits::Bits64,
+                reg: RegisterName::BP,
+            },
+            index: Register {
+                bits: Bits::Bits64,
+                reg: RegisterName::SP,
+            },
+            scale: Scale::One,
+            displacement: Displacement::default(),
+            typ: EffectiveAddressType::Else,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EffectiveAddressType {
+    OnlyDisplacement,
+    OnlyBase,
+    Else,
 }
 
 /// Cases:
@@ -684,16 +727,23 @@ impl FromStr for EffectiveAddress {
         let mut result = EffectiveAddress::default();
         let original = inp;
         let inp = inp.trim_start_matches('[').trim_end_matches(']');
+        let inp = inp.replace(" ", "");
         let mut parts = inp.split('+');
         let part = parts.next().unwrap().trim();
 
         // Case [displacement]
         if Immediate::parse(part).is_ok() {
-            result.displacement = Some(Displacement::from_str(part)?);
+            result.displacement = Displacement::from_str(part)?;
+            result.typ = EffectiveAddressType::OnlyDisplacement;
             return Ok(result);
         } else if let Ok(base) = Register::from_str(part) {
             // Else get register
-            result.base = Some(base);
+            result.base = base;
+
+            if parts.clone().collect::<Vec<_>>().join("").trim().is_empty() {
+                result.typ = EffectiveAddressType::OnlyBase;
+                return Ok(result);
+            }
         } else {
             return Err(anyhow!("Invalid effective address: {}", original));
         }
@@ -702,25 +752,22 @@ impl FromStr for EffectiveAddress {
         if let Some(part) = part {
             // Case [base + displacement]
             if let Ok(displacement) = Displacement::from_str(part.trim()) {
-                result.displacement = Some(displacement);
+                result.typ = EffectiveAddressType::Else;
+                result.displacement = displacement;
                 return Ok(result);
             }
         }
 
         // Else try get [base + index * scale] where scale may be missing  [base + index]
-        if let Some(mut parts) = part.map(|p| p.split('*')) {
-            let index = parts
-                .next()
-                .context(anyhow!("Invalid effective address: {}", original))?;
-            let scale = parts.next().map(|p| p.trim());
+        if let Some(mut parts) = part {
+            let (index, scale) = parts.split_once('*').unwrap_or((parts, ""));
 
             let index = Register::from_str(index.trim())?;
-            result.index = Some(index);
-            result.scale = Some(
-                scale
-                    .map(|s| Scale::from_str(s).unwrap_or_default())
-                    .unwrap_or_default(),
-            );
+            result.typ = EffectiveAddressType::Else;
+            result.index = index;
+            if !scale.is_empty() {
+                result.scale = Scale::from_str(scale)?;
+            }
         } else {
             return Ok(result);
         }
@@ -728,7 +775,8 @@ impl FromStr for EffectiveAddress {
         // Try get [base + index * scale + displacement]
         if let Some(part) = parts.next() {
             if let Ok(displacement) = Displacement::from_str(part.trim()) {
-                result.displacement = Some(displacement);
+                result.typ = EffectiveAddressType::Else;
+                result.displacement = displacement;
                 return Ok(result);
             }
         } else {
@@ -1200,93 +1248,48 @@ impl Fun {
                                 self.bytecode.extend_from_slice(&extender);
                             }
                             (Operand::Register(mut reg), Operand::Immediate(imm)) => {
-                                let mut extender = vec![];
+                                let mut opcode = vec![];
 
                                 if let (true, Ok(imm)) =
                                     (reg.bits as u8 == 64, imm.into_imm(Bits::Bits32))
                                 {
                                     reg.bits = Bits::Bits32;
-                                    extender.extend_from_slice(&[
-                                        REX_W,
-                                        0xC7,
-                                        0xC0 + reg.reg as u8,
-                                    ]);
+                                    opcode.extend_from_slice(&[REX_W, 0xC7, 0xC0 + reg.reg as u8]);
                                 } else {
                                     if reg.bits as u8 == 64 {
-                                        extender.push(REX_W);
+                                        opcode.push(REX_W);
                                     } else if reg.bits as u8 == 16 {
-                                        extender.push(0x66);
+                                        opcode.push(0x66);
                                     }
 
-                                    extender.extend_from_slice(&[0xB8 + reg.reg as u8]);
+                                    opcode.extend_from_slice(&[0xB8 + reg.reg as u8]);
                                 }
 
-                                self.bytecode.extend_from_slice(&extender);
+                                self.bytecode.extend_from_slice(&opcode);
                                 self.bytecode
                                     .extend_from_slice(&Vec::from(imm.into_imm(reg.bits)?));
                             }
                             (Operand::Register(reg), Operand::Memory(mem)) => {
                                 let mut extender = vec![];
+                                let mut opcode = 0x88;
 
-                                let only_base = matches!(mem.displacement, None)
-                                    && matches!(mem.index, None)
-                                    && matches!(mem.scale, None)
-                                    && matches!(mem.base, Some(_));
+                                if !matches!(reg.bits, Bits::Bits8) {
+                                    opcode |= 0b0000_0001;
+                                }
 
-                                let mut sib: u8 = 0b00_000_000;
-                                if let Some(base) = mem.base {
-                                    sib |= base.reg as u8;
-                                }
-                                if let Some(index) = mem.index {
-                                    sib |= (index.reg as u8) << 3;
-                                }
-                                if let Some(scale) = mem.scale {
-                                    sib |= u8::from(scale) << 6;
-                                }
-                                if reg.bits as u8 == 64 {
+                                if matches!(reg.bits, Bits::Bits64) {
                                     extender.push(REX_W);
-                                } else if reg.bits as u8 == 16 {
+                                } else if matches!(reg.bits, Bits::Bits16) {
                                     extender.push(0x66);
                                 }
 
-                                extender.push(0x89 | if reverse_direction { 0b10 } else { 0b00 });
-
-                                let mut modrm = 0b00_000_000;
-
-                                modrm |= (reg.reg as u8) << 3;
-                                modrm |= 0b00_000_100;
-
-                                let imm = if let Some(disp) = mem.displacement {
-                                    println!("Found disp: {:?}", disp);
-                                    let imm = Immediate::from(disp);
-                                    let imm = if let Ok(imm) = imm.into_imm(Bits::Bits8) {
-                                        imm
-                                    } else {
-                                        imm
-                                    };
-
-                                    if Bits::from(imm) as u8 == 8 {
-                                        modrm |= 0b01_000_000;
-                                    } else if Bits::from(imm) as u8 == 32 {
-                                        modrm |= 0b10_000_000;
-                                    }
-
-                                    Vec::from(imm)
-                                } else {
-                                    Vec::new()
-                                };
-
-                                println!("Generating Mod: {:X}", modrm);
-                                println!("Generating SIB: {:X}", sib);
-                                println!("Generating IMM: {:X?}", imm);
-                                println!();
-                                extender.push(modrm);
-                                extender.push(sib);
-
-                                if !only_base {
-                                    extender.extend_from_slice(&imm);
+                                if !reverse_direction {
+                                    opcode |= 0b0000_0010;
                                 }
+                                extender.push(opcode);
+
                                 self.bytecode.extend_from_slice(&extender);
+                                self.bytecode.extend_from_slice(&mem.into_vec(reg)?);
                             }
                             _ => {}
                         }
