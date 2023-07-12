@@ -18,7 +18,7 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use faerie::*;
 use num::Bounded;
@@ -441,6 +441,9 @@ impl Immediate {
     }
 
     fn parse(inp: &str) -> Result<Immediate> {
+        let inp = inp.trim();
+        println!("parsing {:?}", inp);
+
         if inp.starts_with("0x") {
             Self::parse_hex_0x(inp)
         } else if inp.ends_with('h') || inp.ends_with('H') {
@@ -449,6 +452,15 @@ impl Immediate {
             Self::parse_bin_0b(inp)
         } else if inp.ends_with('b') || inp.ends_with('B') {
             Self::parse_bin_b(inp)
+        } else if inp.starts_with('\'') {
+            println!("char literal");
+            let c = inp.trim_matches('\'');
+
+            if c.len() == 1 {
+                Ok(Immediate::Byte(c.chars().next().context(anyhow!(""))? as u8))
+            } else {
+                bail!("Invalid character literal {} in {}", c, inp);
+            }
         } else if !inp.starts_with('-') {
             Self::parse_decimal(inp)
         } else {
@@ -708,12 +720,26 @@ impl Default for EffectiveAddress {
 }
 
 impl IntoBytecode for EffectiveAddress {
-    fn into_bytecode(self, _: &mut Fun, into: Option<Register>) -> Result<Vec<u8>> {
+    fn into_bytecode(self, fun: &mut Fun, into: Option<Register>) -> Result<Vec<u8>> {
         let mem = self;
         let only_base = matches!(mem.typ, EffectiveAddressType::OnlyBase);
         let into = into.unwrap();
         let mut extender = vec![];
-        if only_base {
+
+        if mem.base == RegisterName::IP {
+            let mut modrm = 0b00_000_000;
+            modrm |= u8::from(mem.base);
+            modrm |= u8::from(into) << 3;
+            fun.bytecode.push(modrm);
+
+            if let Some(sym) = mem.symbol {
+                let sym = sym.into_bytecode(fun, None)?;
+                fun.bytecode.extend_from_slice(&sym)
+            } else {
+                fun.bytecode.extend_from_slice(&Vec::from(mem.displacement));
+            }
+            return Ok(extender);
+        } else if only_base {
             let mut modrm = 0b00_000_000;
             modrm += u8::from(mem.base);
             modrm += u8::from(into) << 3;
@@ -895,6 +921,7 @@ impl FromStr for Operand {
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy)]
+#[repr(u8)]
 enum Mn {
     MOV = 0x88,
     CALL = 0xE8,
@@ -905,23 +932,54 @@ enum Mn {
     SUB = 0x29,
     MUL = 0xF7,
     DIV = 0xF6,
-    JMP = 0xE9,
-    JE = 0x74,
-    JNE = 0x75,
-    JG = 0x7F,
-    JGE = 0x7D,
-    JL = 0x7C,
-    JLE = 0x7E,
     CMP = 0x39,
     LEA = 0x8D,
     NOP = 0x90,
     INT = 0xCD,
-    SYSCALL = 0x0F05,
+    LOOP = 0xE2,
+    INC = 0x40,
+    DEC = 0x48,
+    SYSCALL,
+    Jump(Jump),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Jump {
+    JMP = 0xE9,
+    JE = 0x84,
+    JA = 0x87,
+    JAE = 0x83,
+    JNE = 0x85,
+    JG = 0x8F,
+    JGE = 0x8D,
+    JL = 0x8C,
+    JLE = 0x8E,
+}
+
+impl FromStr for Jump {
+    type Err = anyhow::Error;
+    fn from_str(inp: &str) -> Result<Self, Self::Err> {
+        match inp.to_ascii_uppercase().as_str() {
+            "JMP" => Ok(Jump::JMP),
+            "JE" | "JZ" => Ok(Jump::JE),
+            "JA" => Ok(Jump::JA),
+            "JNE" => Ok(Jump::JNE),
+            "JG" => Ok(Jump::JG),
+            "JGE" => Ok(Jump::JGE),
+            "JL" => Ok(Jump::JL),
+            "JLE" => Ok(Jump::JLE),
+            "JAE" => Ok(Jump::JAE),
+            _ => Err(anyhow!("Invalid jump: {}", inp)),
+        }
+    }
 }
 
 impl FromStr for Mn {
     type Err = anyhow::Error;
     fn from_str(inp: &str) -> Result<Self, Self::Err> {
+        if inp.starts_with("J") || inp.starts_with("j") {
+            return Ok(Mn::Jump(Jump::from_str(inp)?));
+        }
         match inp.to_ascii_uppercase().as_str() {
             "MOV" => Ok(Mn::MOV),
             "CALL" => Ok(Mn::CALL),
@@ -932,18 +990,14 @@ impl FromStr for Mn {
             "SUB" => Ok(Mn::SUB),
             "MUL" => Ok(Mn::MUL),
             "DIV" => Ok(Mn::DIV),
-            "JMP" => Ok(Mn::JMP),
-            "JE" => Ok(Mn::JE),
-            "JNE" => Ok(Mn::JNE),
-            "JG" => Ok(Mn::JG),
-            "JGE" => Ok(Mn::JGE),
-            "JL" => Ok(Mn::JL),
-            "JLE" => Ok(Mn::JLE),
             "CMP" => Ok(Mn::CMP),
             "LEA" => Ok(Mn::LEA),
             "NOP" => Ok(Mn::NOP),
             "INT" => Ok(Mn::INT),
             "SYSCALL" => Ok(Mn::SYSCALL),
+            "LOOP" => Ok(Mn::LOOP),
+            "INC" => Ok(Mn::INC),
+            "DEC" => Ok(Mn::DEC),
             _ => Err(anyhow!("Invalid mnemonic: {}", inp)),
         }
     }
@@ -1040,7 +1094,7 @@ impl FromStr for DataDefine {
                 };
 
                 match number.into_imm(purp).or_else(|_| number.into_signed(purp)) {
-                    Ok(_imm) => values.extend_from_slice(&Vec::from(number)),
+                    Ok(imm) => values.extend_from_slice(&Vec::from(imm)),
                     Err(_) => return Err(anyhow!("Invalid number {} for purpose {:?}", val, purp)),
                 }
 
@@ -1167,6 +1221,7 @@ fn generate_elf(
         },
     };
     let mut obj = ArtifactBuilder::new(target).name(name.to_owned()).finish();
+    println!("Defines: {:?}", defines);
 
     let mut sections: HashMap<String, Fun> =
         HashMap::from_iter(functions.into_iter().map(|a| (a.name.clone(), a)));
@@ -1184,7 +1239,7 @@ fn generate_elf(
     obj.declarations(
         defines
             .iter()
-            .map(|dat| (dat.name.clone(), Decl::data().into())),
+            .map(|dat| (dat.name.clone(), Decl::data().with_writable(true).into())),
     )?;
     obj.declarations(
         externs
@@ -1208,6 +1263,7 @@ fn generate_elf(
         if !externs.contains(&link.to)
             && !defines.iter().any(|a| a.name == link.to)
             && !sections.contains_key(&link.to)
+            && start.name != link.to
         {
             anyhow::bail!("Undefined reference to {} at {}", link.to, link.from);
         }
@@ -1564,14 +1620,89 @@ impl Fun {
                     }
                     Mn::MUL => {}
                     Mn::DIV => {}
-                    Mn::JMP => {}
-                    Mn::JE => {}
-                    Mn::JNE => {}
-                    Mn::JG => {}
-                    Mn::JGE => {}
-                    Mn::JL => {}
-                    Mn::JLE => {}
-                    Mn::CMP => {}
+                    Mn::Jump(jmp) => {
+                        if operands.len() != 1 {
+                            return Err(anyhow!(
+                                "Error at line {}: {:?} must have 1 operand",
+                                i,
+                                jmp
+                            ));
+                        }
+
+                        let op = operands.pop().unwrap();
+
+                        self.bytecode.extend_from_slice(&[0x0f, jmp as u8]);
+                        if let Operand::Symbol(sym) = op {
+                            let bytecode = sym.into_bytecode(self, None)?;
+                            self.bytecode.extend_from_slice(&bytecode);
+                        } else {
+                            bail!("Error at line {}: Invalid operand for JE", i);
+                        }
+                    }
+                    Mn::CMP => {
+                        if operands.len() != 2 {
+                            return Err(anyhow!("Error at line {}: ADD must have 2 operands", i));
+                        }
+
+                        let mut op2 = operands.pop().unwrap();
+                        let mut op1 = operands.pop().unwrap();
+
+                        let reverse_direction = matches!(op2, Operand::Register(_))
+                            && matches!(op1, Operand::EffectiveAddress(_));
+                        if reverse_direction {
+                            std::mem::swap(&mut op1, &mut op2)
+                        }
+
+                        if let Operand::Register(ref reg) = op1 {
+                            if Bits::from(*reg) == 64 {
+                                self.bytecode.push(REX_W);
+                            } else if Bits::from(*reg) == 16 {
+                                self.bytecode.push(0x66);
+                            }
+
+                            let mut opcode = 0x39;
+                            if !matches!(op2, Operand::Symbol(_) | Operand::Immediate(_)) {
+                                if !matches!(reg.bits, Bits::Bits8) {
+                                    opcode |= 0b0000_0001;
+                                }
+
+                                if !reverse_direction {
+                                    opcode |= 0b0000_0010;
+                                }
+                            } else {
+                                opcode = 0x81;
+                            }
+
+                            self.bytecode.push(opcode);
+                        }
+
+                        match (op1, op2) {
+                            (Operand::Register(reg1), Operand::Register(reg2)) => {
+                                let bytecode = reg2.into_bytecode(self, Some(reg1))?;
+                                self.bytecode.extend_from_slice(&bytecode);
+                            }
+                            (Operand::Register(reg), Operand::Immediate(imm)) => {
+                                self.bytecode.push(0xc0 + u8::from(reg));
+                                self.bytecode
+                                    .extend_from_slice(&Vec::from(imm.into_imm(Bits::Bits32)?));
+                            }
+                            (Operand::Register(reg), Operand::EffectiveAddress(mem)) => {
+                                let bytecode = mem.into_bytecode(self, Some(reg))?;
+                                self.bytecode.extend_from_slice(&bytecode);
+                            }
+                            (Operand::Register(reg), Operand::Symbol(sym)) => {
+                                self.bytecode.push(0xc0 + u8::from(reg));
+                                let bytecode = sym.into_bytecode(self, Some(reg))?;
+                                self.bytecode.extend_from_slice(&bytecode);
+                            }
+                            _ => {
+                                return Err(anyhow!(
+                                    "Error at line {}: Invalid operands for ADD",
+                                    i
+                                ))
+                            }
+                        }
+                    }
                     Mn::LEA => {
                         if operands.len() != 2 {
                             return Err(anyhow!("Error at line {}: LEA must have 2 operands", i));
@@ -1645,12 +1776,78 @@ impl Fun {
                         }
                     }
                     Mn::NOP => {}
+                    Mn::INC => {
+                        let op = operands
+                            .pop()
+                            .context(anyhow!("Error at line {}: POP must have 1 operand", i))?;
+
+                        match op {
+                            Operand::Register(reg) => {
+                                if Bits::from(reg) == 64 {
+                                    self.bytecode.push(REX_W);
+                                } else if Bits::from(reg) == 16 {
+                                    self.bytecode.push(0x66);
+                                } else if reg.bits as u8 == 32 {
+                                    return Err(anyhow!(
+                                        "Error at line {}: 32 bit mode not supported",
+                                        i
+                                    ));
+                                }
+
+                                self.bytecode.push(0x58 + reg.reg as u8);
+                            }
+                            _ => {
+                                return Err(anyhow!(
+                                    "Error at line {}: Invalid operand for POP",
+                                    i
+                                ));
+                            }
+                        }
+                    }
+                    Mn::DEC => {
+                        let op = operands
+                            .pop()
+                            .context(anyhow!("Error at line {}: POP must have 1 operand", i))?;
+
+                        match op {
+                            Operand::Register(reg) => {
+                                if Bits::from(reg) == 64 {
+                                    self.bytecode.push(REX_W);
+                                } else if Bits::from(reg) == 16 {
+                                    self.bytecode.push(0x66);
+                                } else if reg.bits as u8 == 32 {
+                                    return Err(anyhow!(
+                                        "Error at line {}: 32 bit mode not supported",
+                                        i
+                                    ));
+                                }
+
+                                self.bytecode.push(0x48 + reg.reg as u8);
+                            }
+                            _ => {
+                                return Err(anyhow!(
+                                    "Error at line {}: Invalid operand for POP",
+                                    i
+                                ));
+                            }
+                        }
+                    }
                     Mn::INT => {
                         self.bytecode.push(0xcd);
                         if let Operand::Immediate(num) = &operands[0] {
                             self.bytecode.push(Vec::from(num.into_imm(Bits::Bits8)?)[0]);
                         } else {
                             return Err(anyhow!("Error at line {}: Invalid operand for INT", i));
+                        }
+                    }
+                    Mn::LOOP => {
+                        self.bytecode.push(REX_W);
+                        self.bytecode.push(0xe9);
+                        if let Some(Operand::Symbol(sym)) = &operands.get(0) {
+                            let bytecode = sym.clone().into_bytecode(self, None)?;
+                            self.bytecode.extend_from_slice(&bytecode);
+                        } else {
+                            return Err(anyhow!("Error at line {}: Invalid operand for LOOP", i));
                         }
                     }
                     Mn::SYSCALL => self.bytecode.extend_from_slice(&[0x0F, 0x05]),
