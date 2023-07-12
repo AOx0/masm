@@ -1291,6 +1291,23 @@ impl Fun {
                                 self.bytecode.extend_from_slice(&extender);
                                 self.bytecode.extend_from_slice(&mem.into_vec(reg)?);
                             }
+                            (Operand::Register(reg), Operand::Symbol(sym)) => {
+                                if reg.bits as u8 == 64 {
+                                    self.bytecode.push(REX_W);
+                                } else if reg.bits as u8 == 16 {
+                                    self.bytecode.push(0x66);
+                                }
+                                self.bytecode.extend_from_slice(&[0xB8 + reg.reg as u8]);
+
+                                self.references.push(Ref {
+                                    from: self.name.clone(),
+                                    to: sym.name,
+                                    at: self.bytecode.len() as u64,
+                                });
+                                self.bytecode.extend_from_slice(&Vec::from(
+                                    Immediate::Byte(0).into_imm(reg.bits)?,
+                                ));
+                            }
                             _ => {}
                         }
                     }
@@ -1353,7 +1370,7 @@ impl Fun {
                     Mn::LEA => {}
                     Mn::NOP => {}
                     Mn::INT => {}
-                    Mn::SYSCALL => {}
+                    Mn::SYSCALL => self.bytecode.extend_from_slice(&[0x0F, 0x05]),
                     Mn::LEAVE => {}
                     Mn::CLD => {}
                     Mn::STD => {}
