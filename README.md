@@ -39,7 +39,7 @@ This generates a relocatable ELF file. To link (on linux) it run:
 ld -o main <output>
 ```
 
-As with any linkable file, you may need to specify the linker library paths and nexxesary arguments to link external symbols.
+As with any linkable file, you may need to specify the linker library paths and necessary arguments to link external symbols.
 
 ## Example
 
@@ -57,7 +57,7 @@ main:
 
 Here the `main` function is the entrypoint, the entrypoint routine should always be named main or _start
 
-WWe compile the file with:
+We compile the file with:
 
 ```bash
 masm -p main.s -o main.o
