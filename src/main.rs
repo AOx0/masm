@@ -773,7 +773,7 @@ impl FromStr for EffectiveAddress {
         let mut result = EffectiveAddress::default();
         let original = inp;
         let inp = inp.trim_start_matches('[').trim_end_matches(']');
-        let inp = inp.replace(" ", "");
+        let inp = inp.replace(' ', "");
         let mut parts = inp.split('+');
         let part = parts.next().unwrap().trim();
 
@@ -843,7 +843,7 @@ enum Memory {}
 
 impl From<Register> for Bits {
     fn from(register: Register) -> Self {
-        Bits::from(register.bits)
+        register.bits
     }
 }
 
@@ -856,7 +856,7 @@ enum Operand {
 }
 
 impl IntoBytecode for Immediate {
-    fn into_bytecode(self, from: &mut Fun, into: Option<Register>) -> Result<Vec<u8>> {
+    fn into_bytecode(self, _from: &mut Fun, _into: Option<Register>) -> Result<Vec<u8>> {
         Ok(vec![])
     }
 }
@@ -1040,7 +1040,7 @@ impl FromStr for DataDefine {
                 };
 
                 match number.into_imm(purp).or_else(|_| number.into_signed(purp)) {
-                    Ok(imm) => values.extend_from_slice(&Vec::from(number)),
+                    Ok(_imm) => values.extend_from_slice(&Vec::from(number)),
                     Err(_) => return Err(anyhow!("Invalid number {} for purpose {:?}", val, purp)),
                 }
 
@@ -1577,8 +1577,8 @@ impl Fun {
                             return Err(anyhow!("Error at line {}: LEA must have 2 operands", i));
                         }
 
-                        let mut op2 = operands.pop().unwrap();
-                        let mut op1 = operands.pop().unwrap();
+                        let op2 = operands.pop().unwrap();
+                        let op1 = operands.pop().unwrap();
 
                         if let Operand::Register(ref reg) = op1 {
                             if Bits::from(*reg) == 64 {
@@ -1587,12 +1587,12 @@ impl Fun {
                                 self.bytecode.push(0x66);
                             }
 
-                            let mut opcode = 0x8d;
+                            let opcode = 0x8d;
                             self.bytecode.push(opcode);
                         }
 
                         match (op1, op2) {
-                            (Operand::Register(reg), Operand::EffectiveAddress(mut mem)) => {
+                            (Operand::Register(reg), Operand::EffectiveAddress(mem)) => {
                                 let mut extender = vec![];
 
                                 let mut modrm = 0b00_000_000;
@@ -1612,26 +1612,23 @@ impl Fun {
                                     let bytecode = sym.into_bytecode(self, Some(reg))?;
                                     self.bytecode.extend_from_slice(&bytecode);
                                     continue;
-                                } else if mem.base == RegisterName::IP {
+                                } else if mem.base == RegisterName::IP
+                                    || mem.index == RegisterName::SP
+                                {
+                                    if mem.index == RegisterName::SP {
+                                        modrm |= 0b10_000_000;
+                                    }
                                     modrm |= u8::from(mem.base);
                                     extender.push(modrm);
                                     extender.extend_from_slice(&Vec::from(imm));
                                 } else if matches!(mem.typ, EffectiveAddressType::OnlyBase) {
                                     modrm |= u8::from(mem.base);
                                     extender.push(modrm);
-                                } else if matches!(mem.typ, EffectiveAddressType::OnlyDisplacement)
-                                {
-                                    modrm |= 0b00_000_100;
-                                    extender.push(modrm);
-                                    extender.push(sib);
-                                    extender.extend_from_slice(&Vec::from(imm));
-                                } else if mem.index == RegisterName::SP {
-                                    modrm = 0b10_000_100;
-                                    modrm |= u8::from(mem.base);
-                                    extender.push(modrm);
-                                    extender.extend_from_slice(&Vec::from(imm));
                                 } else {
-                                    modrm |= 0b10_000_100;
+                                    if !matches!(mem.typ, EffectiveAddressType::OnlyDisplacement) {
+                                        modrm |= 0b10_000_100;
+                                    }
+
                                     extender.push(modrm);
                                     extender.push(sib);
                                     extender.extend_from_slice(&Vec::from(imm));
