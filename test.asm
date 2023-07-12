@@ -4,12 +4,7 @@ extern printf
 
 print:
     mov  rax, 0x0
-    mov  rdi, msg
-    lea  rdi, [rip]
-    lea  rdi, [0xA]
-    lea  rdi, [rip + 0xA]
-    lea  rdi, [rcx + 0xA]
-    lea  rdi, [rcx + rdx * 0x1 + 0x0]
+    lea  rdi, [rip + msg]
     call printf
     ret
 

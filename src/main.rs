@@ -678,13 +678,14 @@ impl FromStr for Displacement {
 
 /// En caso de que se usen valores por default, se debe usar el valor de 101 como base (copia de rsp) y el valor de 100 como index (rsp)
 /// con escala de 0b00, efectivamente haciendo que no haya indexado adicional
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct EffectiveAddress {
     base: Register,
     index: Register,
     scale: Scale,
     displacement: Displacement,
     typ: EffectiveAddressType,
+    symbol: Option<Symbol>,
 }
 
 impl Default for EffectiveAddress {
@@ -701,6 +702,7 @@ impl Default for EffectiveAddress {
             scale: Scale::One,
             displacement: Displacement::default(),
             typ: EffectiveAddressType::Else,
+            symbol: None,
         }
     }
 }
@@ -803,14 +805,19 @@ impl FromStr for EffectiveAddress {
         }
 
         // Else try get [base + index * scale] where scale may be missing  [base + index]
-        if let Some(mut parts) = part {
+        if let Some(parts) = part {
             let (index, scale) = parts.split_once('*').unwrap_or((parts, ""));
 
-            let index = Register::from_str(index.trim())?;
-            result.typ = EffectiveAddressType::Else;
-            result.index = index;
-            if !scale.is_empty() {
-                result.scale = Scale::from_str(scale)?;
+            if let Ok(index) = Register::from_str(index.trim()) {
+                result.typ = EffectiveAddressType::Else;
+                result.index = index;
+                if !scale.is_empty() {
+                    result.scale = Scale::from_str(scale)?;
+                }
+                return Ok(result);
+            } else {
+                result.symbol = Some(Symbol::from_str(parts.trim())?);
+                return Ok(result);
             }
         } else {
             return Ok(result);
@@ -1192,6 +1199,20 @@ fn generate_elf(
     defines
         .iter_mut()
         .try_for_each(|dat| obj.define(dat.name.clone(), std::mem::take(&mut dat.data)))?;
+
+    for link in start
+        .references
+        .iter()
+        .chain(sections.values().flat_map(|s| s.references.iter()))
+    {
+        if !externs.contains(&link.to)
+            && !defines.iter().any(|a| a.name == link.to)
+            && !sections.contains_key(&link.to)
+        {
+            anyhow::bail!("Undefined reference to {} at {}", link.to, link.from);
+        }
+    }
+
     start
         .references
         .into_iter()
@@ -1585,7 +1606,13 @@ impl Fun {
                                 let imm =
                                     Immediate::from(mem.displacement).into_imm(Bits::Bits32)?;
 
-                                if mem.base == RegisterName::IP {
+                                if let Some(sym) = mem.symbol {
+                                    modrm |= u8::from(mem.base);
+                                    self.bytecode.push(modrm);
+                                    let bytecode = sym.into_bytecode(self, Some(reg))?;
+                                    self.bytecode.extend_from_slice(&bytecode);
+                                    continue;
+                                } else if mem.base == RegisterName::IP {
                                     modrm |= u8::from(mem.base);
                                     extender.push(modrm);
                                     extender.extend_from_slice(&Vec::from(imm));
@@ -1599,13 +1626,12 @@ impl Fun {
                                     extender.push(sib);
                                     extender.extend_from_slice(&Vec::from(imm));
                                 } else if mem.index == RegisterName::SP {
-                                    modrm |= 0b10_000_000;
+                                    modrm = 0b10_000_100;
                                     modrm |= u8::from(mem.base);
                                     extender.push(modrm);
                                     extender.extend_from_slice(&Vec::from(imm));
                                 } else {
-                                    modrm |= 0b10_000_000;
-                                    modrm |= u8::from(mem.base);
+                                    modrm |= 0b10_000_100;
                                     extender.push(modrm);
                                     extender.push(sib);
                                     extender.extend_from_slice(&Vec::from(imm));
