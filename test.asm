@@ -3,9 +3,13 @@ msg db "Hola Mundo", 0xA, 0x0
 extern printf
 
 print:
-    mov rax, 0
-    mov rdi, msg
-    mov rdi, [rsp + rdi * 4]
+    mov  rax, 0x0
+    mov  rdi, msg
+    lea  rdi, [rip]
+    lea  rdi, [0xA]
+    lea  rdi, [rip + 0xA]
+    lea  rdi, [rcx + 0xA]
+    lea  rdi, [rcx + rdx * 0x1 + 0x0]
     call printf
     ret
 
