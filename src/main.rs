@@ -4,9 +4,8 @@
 //!     - Intel® 64 and IA-32 Architectures Software Developer’s Manual
 //!       Combined Volumes: 1, 2A, 2B, 2C, 2D, 3A, 3B, 3C, 3D, and 4
 //!       At: https://cdrdv2.intel.com/v1/dl/getContent/671200
-#![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::take;
 use std::str::FromStr;
 use std::{
@@ -17,12 +16,13 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use faerie::*;
+#[allow(unused_imports)]
 use num::Bounded;
 use target_lexicon::Triple;
 
 mod parser;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum Bits {
     Bits8 = 8,
     Bits16 = 16,
@@ -42,7 +42,7 @@ impl From<Bits> for u8 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct Register {
     reg: RegisterName,
     bits: Bits,
@@ -89,7 +89,7 @@ impl FromStr for Register {
         } else if inp.len() == 2 {
             (Bits::Bits16, inp)
         } else {
-            return Err(anyhow!("Invalid register: {}", inp));
+            bail!("Invalid register: {}", inp);
         };
 
         let reg = match reg {
@@ -102,14 +102,14 @@ impl FromStr for Register {
             "si" => RegisterName::SI,
             "di" => RegisterName::DI,
             "ip" => RegisterName::IP,
-            _ => return Err(anyhow!("Invalid register: {}", inp)),
+            _ => bail!("Invalid register: {}", inp),
         };
 
         Ok(Register { reg, bits })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RegisterName {
     AX = 0b000,
     CX = 0b001,
@@ -122,7 +122,7 @@ enum RegisterName {
     IP,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum Immediate {
     SByte(i8),
     SWord(i16),
@@ -544,7 +544,7 @@ impl FromStr for Immediate {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Symbol {
     name: String,
 }
@@ -565,7 +565,7 @@ impl IntoBytecode for Symbol {
 impl FromStr for Symbol {
     type Err = anyhow::Error;
     fn from_str(inp: &str) -> Result<Self, Self::Err> {
-        if !parse_name(inp)?.is_none() {
+        if !consume_valid_name(inp)?.is_none() {
             Err(anyhow!("Invalid symbol: {}", inp))
         } else {
             Ok(Symbol {
@@ -575,7 +575,7 @@ impl FromStr for Symbol {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 enum Scale {
     #[default]
     One = 1,
@@ -616,7 +616,7 @@ impl FromStr for Scale {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum Displacement {
     Byte(i8),
     Word(i16),
@@ -680,7 +680,7 @@ impl FromStr for Displacement {
 
 /// En caso de que se usen valores por default, se debe usar el valor de 101 como base (copia de rsp) y el valor de 100 como index (rsp)
 /// con escala de 0b00, efectivamente haciendo que no haya indexado adicional
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct EffectiveAddress {
     base: Register,
     index: Register,
@@ -767,7 +767,7 @@ impl IntoBytecode for EffectiveAddress {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum EffectiveAddressType {
     OnlyDisplacement,
     OnlyBase,
@@ -807,7 +807,7 @@ impl FromStr for EffectiveAddress {
                 return Ok(result);
             }
         } else {
-            return Err(anyhow!("Invalid effective address: {}", original));
+            bail!("Invalid effective address: {}", original);
         }
 
         let part = parts.next().map(|p| p.trim());
@@ -859,7 +859,7 @@ impl From<Register> for Bits {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum Operand {
     Immediate(Immediate),
     EffectiveAddress(EffectiveAddress),
@@ -906,7 +906,7 @@ impl FromStr for Operand {
 }
 
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 enum Mn {
     MOV = 0x88,
@@ -928,7 +928,7 @@ enum Mn {
     Jump(Jump),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum Jump {
     JMP = 0xFF,
     JE = 0x84,
@@ -987,7 +987,7 @@ impl FromStr for Mn {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Mnemonic {
     name: Mn,
     operands: Vec<Operand>,
@@ -1018,11 +1018,22 @@ impl FromStr for Mnemonic {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq)]
 struct DataDefine {
     name: String,
     data: Vec<u8>,
-    purpose: Bits,
+}
+
+impl std::hash::Hash for DataDefine {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl PartialEq<Self> for DataDefine {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
 }
 
 impl FromStr for DataDefine {
@@ -1039,7 +1050,7 @@ impl FromStr for DataDefine {
             "dd" => Bits::Bits32,
             "dq" => Bits::Bits64,
             // "dt" => DataSize::ba,
-            _ => return Err(anyhow!("Purpose {} is not valid", &decl[0..2])),
+            _ => bail!("Purpose {} is not valid", &decl[0..2]),
         };
 
         let mut values: Vec<u8> = vec![];
@@ -1069,9 +1080,7 @@ impl FromStr for DataDefine {
                     if c.len() == 1 {
                         Immediate::Byte(c.chars().next().context(anyhow!(""))? as u8)
                     } else {
-                        return Err(anyhow!(
-                            "Values starting with ' should be only chars. Ex: 'a'"
-                        ));
+                        bail!("Values starting with ' should be only chars. Ex: 'a'");
                     }
                 } else {
                     Immediate::parse(&val).context(anyhow!("Failed to get number from {}", val))?
@@ -1079,7 +1088,7 @@ impl FromStr for DataDefine {
 
                 match number.into_imm(purp).or_else(|_| number.into_signed(purp)) {
                     Ok(imm) => values.extend_from_slice(&Vec::from(imm)),
-                    Err(_) => return Err(anyhow!("Invalid number {} for purpose {:?}", val, purp)),
+                    Err(_) => bail!("Invalid number {} for purpose {:?}", val, purp),
                 }
 
                 Ok::<_, anyhow::Error>(())
@@ -1087,13 +1096,12 @@ impl FromStr for DataDefine {
 
         Ok(DataDefine {
             name: name.to_string(),
-            purpose: purp,
             data: values,
         })
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Line {
     Mnemonic(Mnemonic),
     DataDefine(DataDefine),
@@ -1103,7 +1111,7 @@ enum Line {
     Empty,
 }
 
-fn parse_name(inp: &str) -> Result<Option<(char, char)>> {
+fn consume_valid_name(inp: &str) -> Result<Option<(char, char)>> {
     use parser::*;
     let parse_name = match_until_err(match_any_of(&[
         CharMatch::Char('_'),
@@ -1149,7 +1157,7 @@ impl FromStr for Line {
 
         let is_definition: for<'a> fn(&'a str) -> Result<bool> = |inp| {
             let inp = inp.trim_start().to_ascii_lowercase();
-            let res = parse_name(&inp)?;
+            let res = consume_valid_name(&inp)?;
 
             if let Some(('d', b)) = res {
                 Ok(['b', 'w', 'd', 'q', 't'].iter().any(|&s| s == b))
@@ -1160,7 +1168,7 @@ impl FromStr for Line {
 
         let is_function: for<'a> fn(&'a str) -> Result<bool> = |inp: &str| {
             let inp = inp.trim_start();
-            let res = parse_name(inp.trim())?;
+            let res = consume_valid_name(inp.trim())?;
 
             Ok(matches!(res, Some((':', _))))
         };
@@ -1173,7 +1181,7 @@ impl FromStr for Line {
                 .iter()
                 .any(|s| lower.contains(s))
         {
-            return Err(anyhow!("Invalid data definition {}", inp));
+            bail!("Invalid data definition {}", inp);
         } else if is_definition {
             Line::DataDefine(DataDefine::from_str(inp)?)
         } else if lower.trim_start().contains("extern") {
@@ -1195,9 +1203,9 @@ impl FromStr for Line {
 
 fn generate_elf(
     out: File,
-    functions: Vec<Fun>,
-    mut defines: Vec<DataDefine>,
-    externs: Vec<String>,
+    functions: HashSet<Fun>,
+    defines: HashSet<DataDefine>,
+    externs: HashSet<String>,
 ) -> Result<()> {
     let name = "out.o";
 
@@ -1239,11 +1247,11 @@ fn generate_elf(
 
     sections
         .iter_mut()
-        .try_for_each(|(name, sect)| obj.define(name, std::mem::take(&mut sect.bytecode)))?;
+        .try_for_each(|(name, sect)| obj.define(name, take(&mut sect.bytecode)))?;
     obj.define("_start", start.bytecode)?;
     defines
-        .iter_mut()
-        .try_for_each(|dat| obj.define(dat.name.clone(), std::mem::take(&mut dat.data)))?;
+        .iter()
+        .try_for_each(|dat| obj.define(dat.name.clone(), dat.data.clone()))?;
 
     for link in start
         .references
@@ -1255,7 +1263,7 @@ fn generate_elf(
             && !sections.contains_key(&link.to)
             && start.name != link.to
         {
-            anyhow::bail!("Undefined reference to {} at {}", link.to, link.from);
+            bail!("Undefined reference to {} at {}", link.to, link.from);
         }
     }
 
@@ -1302,7 +1310,7 @@ fn read_script(path: &std::path::Path) -> Result<String> {
     Ok(script)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Ref {
     from: String,
     to: String,
@@ -1319,7 +1327,7 @@ impl Ref {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq)]
 pub struct Fun {
     name: String,
     lines: Vec<Line>,
@@ -1327,13 +1335,22 @@ pub struct Fun {
     bytecode: Vec<u8>,
 }
 
+impl std::hash::Hash for Fun {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl PartialEq for Fun {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
 impl Fun {
     fn assemble(&mut self) -> Result<&mut Vec<u8>> {
         self.bytecode.clear();
 
-        const REX_V: u8 = 0x40;
-        const REX_X: u8 = 0x42;
-        const REX_B: u8 = 0x44;
         const REX_W: u8 = 0x48;
 
         let lines = take(&mut self.lines);
@@ -1348,7 +1365,7 @@ impl Fun {
                 match name {
                     Mn::MOV => {
                         if operands.len() != 2 {
-                            return Err(anyhow!("Error at line {}: MOV must have 2 operands", i));
+                            bail!("Error at line {}: MOV must have 2 operands", i);
                         }
 
                         let mut op2 = operands.pop().unwrap();
@@ -1405,12 +1422,12 @@ impl Fun {
                                 self.bytecode.extend_from_slice(&bytecode);
                             }
                             (op1, op2) => {
-                                return Err(anyhow!(
+                                bail!(
                                     "Error at line {}: Invalid operands for MOV ({:?}, {:?})",
                                     i,
                                     op1,
                                     op2
-                                ));
+                                );
                             }
                         }
                     }
@@ -1425,10 +1442,10 @@ impl Fun {
                             });
                             self.bytecode.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
                         } else {
-                            return Err(anyhow!(
+                            bail!(
                                 "Error at line {}: Invalid operand for CALL, must be a symbol",
                                 i
-                            ));
+                            );
                         }
                     }
                     Mn::RET => {
@@ -1440,10 +1457,7 @@ impl Fun {
                                 64 => self.bytecode.push(REX_W),
                                 16 => self.bytecode.push(0x66),
                                 32 => {
-                                    return Err(anyhow!(
-                                        "Error at line {}: 32 bit mode not supported",
-                                        i
-                                    ));
+                                    bail!("Error at line {}: 32 bit mode not supported", i);
                                 }
                                 _ => (),
                             }
@@ -1456,7 +1470,7 @@ impl Fun {
                                 .extend_from_slice(&Vec::from(num.into_imm(Bits::Bits32)?));
                         }
                         _ => {
-                            return Err(anyhow!("Error at line {}: Invalid operand for PUSH", i));
+                            bail!("Error at line {}: Invalid operand for PUSH", i);
                         }
                     },
                     Mn::POP => {
@@ -1470,10 +1484,7 @@ impl Fun {
                                     Bits::Bits64 => self.bytecode.push(REX_W),
                                     Bits::Bits16 => self.bytecode.push(0x66),
                                     Bits::Bits32 => {
-                                        return Err(anyhow!(
-                                            "Error at line {}: 32 bit mode not supported",
-                                            i
-                                        ));
+                                        bail!("Error at line {}: 32 bit mode not supported", i);
                                     }
                                     _ => (),
                                 }
@@ -1481,16 +1492,13 @@ impl Fun {
                                 self.bytecode.push(0x58 + reg.reg as u8);
                             }
                             _ => {
-                                return Err(anyhow!(
-                                    "Error at line {}: Invalid operand for POP",
-                                    i
-                                ));
+                                bail!("Error at line {}: Invalid operand for POP", i);
                             }
                         }
                     }
                     Mn::ADD => {
                         if operands.len() != 2 {
-                            return Err(anyhow!("Error at line {}: ADD must have 2 operands", i));
+                            bail!("Error at line {}: ADD must have 2 operands", i);
                         }
 
                         let mut op2 = operands.pop().unwrap();
@@ -1547,18 +1555,18 @@ impl Fun {
                                 self.bytecode.extend_from_slice(&bytecode);
                             }
                             (op1, op2) => {
-                                return Err(anyhow!(
+                                bail!(
                                     "Error at line {}: Invalid operands for ADD ({:?}, {:?})",
                                     i,
                                     op1,
                                     op2
-                                ));
+                                );
                             }
                         }
                     }
                     Mn::SUB => {
                         if operands.len() != 2 {
-                            return Err(anyhow!("Error at line {}: SUB must have 2 operands", i));
+                            bail!("Error at line {}: SUB must have 2 operands", i);
                         }
 
                         let mut op2 = operands.pop().unwrap();
@@ -1615,12 +1623,12 @@ impl Fun {
                                 self.bytecode.extend_from_slice(&bytecode);
                             }
                             (op1, op2) => {
-                                return Err(anyhow!(
+                                bail!(
                                     "Error at line {}: Invalid operands for SUB ({:?}, {:?})",
                                     i,
                                     op1,
                                     op2
-                                ));
+                                );
                             }
                         }
                     }
@@ -1628,11 +1636,7 @@ impl Fun {
                     Mn::DIV => {}
                     Mn::Jump(jmp) => {
                         if operands.len() != 1 {
-                            return Err(anyhow!(
-                                "Error at line {}: {:?} must have 1 operand",
-                                i,
-                                jmp
-                            ));
+                            bail!("Error at line {}: {:?} must have 1 operand", i, jmp);
                         }
 
                         let op = operands.pop().unwrap();
@@ -1652,7 +1656,7 @@ impl Fun {
                     }
                     Mn::CMP => {
                         if operands.len() != 2 {
-                            return Err(anyhow!("Error at line {}: ADD must have 2 operands", i));
+                            bail!("Error at line {}: ADD must have 2 operands", i);
                         }
 
                         let mut op2 = operands.pop().unwrap();
@@ -1709,18 +1713,18 @@ impl Fun {
                                 self.bytecode.extend_from_slice(&bytecode);
                             }
                             (op1, op2) => {
-                                return Err(anyhow!(
+                                bail!(
                                     "Error at line {}: Invalid operands for operands for operands for CMP ({:?}, {:?})",
                                     i,
                                     op1,
                                     op2
-                                ));
+                                );
                             }
                         }
                     }
                     Mn::LEA => {
                         if operands.len() != 2 {
-                            return Err(anyhow!("Error at line {}: LEA must have 2 operands", i));
+                            bail!("Error at line {}: LEA must have 2 operands", i);
                         }
 
                         let op2 = operands.pop().unwrap();
@@ -1783,12 +1787,12 @@ impl Fun {
                                 self.bytecode.extend_from_slice(&extender);
                             }
                             (op1, op2) => {
-                                return Err(anyhow!(
+                                bail!(
                                     "Error at line {}: Invalid operands for LEA ({:?}, {:?})",
                                     i,
                                     op1,
                                     op2
-                                ));
+                                );
                             }
                         }
                     }
@@ -1804,10 +1808,7 @@ impl Fun {
                                     Bits::Bits64 => self.bytecode.push(REX_W),
                                     Bits::Bits16 => self.bytecode.push(0x66),
                                     Bits::Bits32 => {
-                                        return Err(anyhow!(
-                                            "Error at line {}: 32 bit mode not supported",
-                                            i
-                                        ));
+                                        bail!("Error at line {}: 32 bit mode not supported", i);
                                     }
                                     _ => (),
                                 }
@@ -1817,10 +1818,7 @@ impl Fun {
                                 self.bytecode.push(0xc0 + u8::from(reg));
                             }
                             _ => {
-                                return Err(anyhow!(
-                                    "Error at line {}: Invalid operand for POP",
-                                    i
-                                ));
+                                bail!("Error at line {}: Invalid operand for POP", i);
                             }
                         }
                     }
@@ -1835,10 +1833,7 @@ impl Fun {
                                     Bits::Bits64 => self.bytecode.push(REX_W),
                                     Bits::Bits16 => self.bytecode.push(0x66),
                                     Bits::Bits32 => {
-                                        return Err(anyhow!(
-                                            "Error at line {}: 32 bit mode not supported",
-                                            i
-                                        ));
+                                        bail!("Error at line {}: 32 bit mode not supported", i);
                                     }
                                     _ => (),
                                 }
@@ -1848,10 +1843,7 @@ impl Fun {
                                 self.bytecode.push(0xc8 + u8::from(reg));
                             }
                             _ => {
-                                return Err(anyhow!(
-                                    "Error at line {}: Invalid operand for POP",
-                                    i
-                                ));
+                                bail!("Error at line {}: Invalid operand for POP", i);
                             }
                         }
                     }
@@ -1861,7 +1853,7 @@ impl Fun {
                         if let Operand::Immediate(num) = &operands[0] {
                             self.bytecode.push(Vec::from(num.into_imm(Bits::Bits8)?)[0]);
                         } else {
-                            return Err(anyhow!("Error at line {}: Invalid operand for INT", i));
+                            bail!("Error at line {}: Invalid operand for INT", i);
                         }
                     }
 
@@ -1890,29 +1882,21 @@ fn get_segments(input: &str) -> Result<Vec<Line>> {
                     result.push(parsed);
                 }
                 Line::Mnemonic(mut mnemonic) => {
-                    if let Some(last) = result.last_mut() {
-                        if let Line::Function(fun) = last {
-                            mnemonic.line = i + 1;
-                            fun.lines.push(Line::Mnemonic(mnemonic));
-                        } else {
-                            return Err(anyhow!(
-                                "Mnemonic outside of function at line {}:\n\n    {}\n",
-                                i,
-                                line
-                            ));
-                        }
+                    if let Some(Line::Function(fun)) = result.last_mut() {
+                        mnemonic.line = i + 1;
+                        fun.lines.push(Line::Mnemonic(mnemonic));
                     } else {
-                        return Err(anyhow!(
+                        bail!(
                             "Mnemonic outside of function at line {}:\n\n    {}\n",
                             i,
                             line
-                        ));
+                        );
                     }
                 }
                 Line::Comment(_) | Line::Empty => {}
             },
             Err(e) => {
-                return Err(anyhow!("Error at line {}: {:?}\n\n    {}\n", i, e, line));
+                bail!("Error at line {}: {:?}\n\n    {}\n", i, e, line);
             }
         }
     }
@@ -1942,16 +1926,19 @@ fn main() -> Result<()> {
         }
     };
 
-    let mut data_define = vec![];
-    let mut exts = vec![];
-    let mut functions = vec![];
+    let mut data_define = HashSet::new();
+    let mut exts = HashSet::new();
+    let mut functions = HashSet::new();
     for section in sections.into_iter() {
         match section {
             Line::DataDefine(data) => {
-                data_define.push(data);
+                let name = data.name.clone();
+                if !data_define.insert(data) {
+                    bail!("Error: Duplicate data definition: {}", name)
+                }
             }
             Line::Extern(ext) => {
-                exts.push(ext);
+                exts.insert(ext);
             }
             Line::Function(mut fun) => {
                 if fun.name == "main" {
@@ -1965,7 +1952,10 @@ fn main() -> Result<()> {
                     }
                 }
 
-                functions.push(fun.clone());
+                let name = fun.name.clone();
+                if !functions.insert(fun) {
+                    bail!("Error: Duplicate function definition: {}", name)
+                }
             }
             _ => {}
         }

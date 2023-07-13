@@ -11,18 +11,6 @@ pub trait Parser<V>: Fn(&str) -> Result<(V, &str), ParserError> {}
 
 impl<V, T: Fn(&str) -> Result<(V, &str), ParserError>> Parser<V> for T {}
 
-pub fn parse_char<'a>(match_char: char) -> impl Parser<&'a str> {
-    move |input| {
-        if input.is_empty() {
-            Err(ParserError::EmptyInput)
-        } else if input.chars().next().expect("Unexpected empty str") == match_char {
-            Ok(("", &input[1..]))
-        } else {
-            Err(ParserError::NotFound)
-        }
-    }
-}
-
 pub fn and_then<V>(parser1: impl Parser<V>, parser2: impl Parser<V>) -> impl Parser<Vec<V>> {
     move |input| {
         let (res1, remain1) = parser1(input)?;
@@ -35,17 +23,6 @@ pub fn map<V, K>(parser: impl Parser<V>, f: impl Fn((V, &str)) -> (K, &str)) -> 
     move |input| Ok(f(parser(input)?))
 }
 
-fn or_else<V>(parser1: impl Parser<V>, parser2: impl Parser<V>) -> impl Parser<Vec<V>> {
-    move |input| {
-        if let Ok((res, remain)) = parser1(input) {
-            Ok((vec![res], remain))
-        } else {
-            let (res, remain) = parser2(input)?;
-            Ok((vec![res], remain))
-        }
-    }
-}
-
 impl Display for ParserError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -55,7 +32,7 @@ impl Display for ParserError {
     }
 }
 
-impl<'a> std::error::Error for ParserError {}
+impl std::error::Error for ParserError {}
 
 #[derive(Clone)]
 pub enum CharMatch {
@@ -63,7 +40,7 @@ pub enum CharMatch {
     CharRange(RangeInclusive<char>),
 }
 
-pub fn match_any_of<'a>(match_chars: &'a [CharMatch]) -> impl Parser<()> + 'a {
+pub fn match_any_of(match_chars: &[CharMatch]) -> impl Parser<()> + '_ {
     move |input| {
         if input.is_empty() {
             Err(ParserError::EmptyInput)
