@@ -20,6 +20,7 @@ use faerie::*;
 use num::Bounded;
 use target_lexicon::Triple;
 
+mod elf;
 mod parser;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -565,7 +566,7 @@ impl IntoBytecode for Symbol {
 impl FromStr for Symbol {
     type Err = anyhow::Error;
     fn from_str(inp: &str) -> Result<Self, Self::Err> {
-        if !consume_valid_name(inp)?.is_none() {
+        if consume_valid_name(inp)?.is_some() {
             Err(anyhow!("Invalid symbol: {}", inp))
         } else {
             Ok(Symbol {
@@ -909,21 +910,21 @@ impl FromStr for Operand {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 enum Mn {
-    MOV = 0x88,
-    CALL = 0xE8,
-    RET = 0xC3,
-    PUSH = 0x50,
-    POP = 0x58,
-    ADD = 0x01,
-    SUB = 0x29,
-    MUL = 0xF7,
-    DIV = 0xF6,
-    CMP = 0x39,
-    LEA = 0x8D,
-    NOP = 0x90,
-    INT = 0xCD,
-    INC = 0x40,
-    DEC = 0x48,
+    MOV,
+    CALL,
+    RET,
+    PUSH,
+    POP,
+    ADD,
+    SUB,
+    MUL,
+    DIV,
+    CMP,
+    LEA,
+    NOP,
+    INT,
+    INC,
+    DEC,
     SYSCALL,
     Jump(Jump),
 }
@@ -962,7 +963,7 @@ impl FromStr for Jump {
 impl FromStr for Mn {
     type Err = anyhow::Error;
     fn from_str(inp: &str) -> Result<Self, Self::Err> {
-        if inp.starts_with("J") || inp.starts_with("j") {
+        if inp.starts_with('J') || inp.starts_with('j') {
             return Ok(Mn::Jump(Jump::from_str(inp)?));
         }
         match inp.to_ascii_uppercase().as_str() {
@@ -987,11 +988,62 @@ impl FromStr for Mn {
     }
 }
 
+impl Mn {
+    fn bytecode(&self) -> [Vec<u8>; 2] {
+        match self {
+            Mn::MOV => [vec![0x88], vec![0xc7]],
+            Mn::CALL => [vec![0xe8], vec![]],
+            Mn::RET => [vec![0xc3], vec![]],
+            Mn::PUSH => [vec![0x50], vec![]],
+            Mn::POP => [vec![0x58], vec![]],
+            Mn::ADD => [vec![0x00], vec![0x81]],
+            Mn::SUB => [vec![0x2B], vec![0x81]],
+            Mn::MUL => [vec![0xF7], vec![]],
+            Mn::DIV => [vec![0xF7], vec![]],
+            Mn::CMP => [vec![0x39], vec![0x81]],
+            Mn::LEA => [vec![0x8D], vec![]],
+            Mn::NOP => [vec![0x90], vec![]],
+            Mn::INT => [vec![0xCD], vec![]],
+            Mn::SYSCALL => [vec![0x0F, 0x05], vec![]],
+            Mn::INC => [vec![0xFF], vec![]],
+            Mn::DEC => [vec![0xFF], vec![]],
+            _ => unreachable!("Jump is a special case"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Mnemonic {
     name: Mn,
     operands: Vec<Operand>,
-    line: usize,
+}
+
+impl Mnemonic {
+    fn opcode(&self) -> [Vec<u8>; 2] {
+        self.name.bytecode()
+    }
+
+    fn num_args(&self) -> u8 {
+        match self.name {
+            Mn::MOV => 2,
+            Mn::CALL => 1,
+            Mn::RET => 0,
+            Mn::PUSH => 1,
+            Mn::POP => 1,
+            Mn::ADD => 2,
+            Mn::SUB => 2,
+            Mn::MUL => 2,
+            Mn::DIV => 2,
+            Mn::CMP => 2,
+            Mn::LEA => 2,
+            Mn::NOP => 0,
+            Mn::INT => 1,
+            Mn::SYSCALL => 0,
+            Mn::INC => 1,
+            Mn::DEC => 1,
+            Mn::Jump(_) => 1,
+        }
+    }
 }
 
 impl FromStr for Mnemonic {
@@ -1010,16 +1062,12 @@ impl FromStr for Mnemonic {
             .map(Operand::from_str)
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Mnemonic {
-            name,
-            operands,
-            line: 0,
-        })
+        Ok(Mnemonic { name, operands })
     }
 }
 
 #[derive(Debug, Clone, Eq)]
-struct DataDefine {
+pub struct DataDefine {
     name: String,
     data: Vec<u8>,
 }
@@ -1102,6 +1150,12 @@ impl FromStr for DataDefine {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct LineStruct {
+    line: Line,
+    line_num: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Line {
     Mnemonic(Mnemonic),
     DataDefine(DataDefine),
@@ -1162,7 +1216,7 @@ impl FromStr for Line {
             if let Some(('d', b)) = res {
                 Ok(['b', 'w', 'd', 'q', 't'].iter().any(|&s| s == b))
             } else {
-                return Ok(false);
+                Ok(false)
             }
         };
 
@@ -1199,88 +1253,6 @@ impl FromStr for Line {
 
         Ok(res)
     }
-}
-
-fn generate_elf(
-    out: File,
-    functions: HashSet<Fun>,
-    defines: HashSet<DataDefine>,
-    externs: HashSet<String>,
-) -> Result<()> {
-    let name = "out.o";
-
-    let target = Triple {
-        architecture: target_lexicon::Architecture::X86_64,
-        vendor: target_lexicon::Vendor::Unknown,
-        operating_system: target_lexicon::OperatingSystem::Unknown,
-        environment: target_lexicon::Environment::Unknown,
-        binary_format: if cfg!(target_os = "macos") {
-            target_lexicon::BinaryFormat::Macho
-        } else {
-            target_lexicon::BinaryFormat::Elf
-        },
-    };
-    let mut obj = ArtifactBuilder::new(target).name(name.to_owned()).finish();
-    let mut sections: HashMap<String, Fun> =
-        HashMap::from_iter(functions.into_iter().map(|a| (a.name.clone(), a)));
-
-    let (_, start) = sections
-        .remove_entry("_start")
-        .context("main or _start must be defined")?;
-
-    obj.declarations(sections.keys().map(|name| (name, Decl::function().into())))?;
-    obj.declarations(
-        [("_start", Decl::function().global().into())]
-            .iter()
-            .cloned(),
-    )?;
-    obj.declarations(
-        defines
-            .iter()
-            .map(|dat| (dat.name.clone(), Decl::data().with_writable(true).into())),
-    )?;
-    obj.declarations(
-        externs
-            .iter()
-            .map(|name| (name.clone(), Decl::function_import().into())),
-    )?;
-
-    sections
-        .iter_mut()
-        .try_for_each(|(name, sect)| obj.define(name, take(&mut sect.bytecode)))?;
-    obj.define("_start", start.bytecode)?;
-    defines
-        .iter()
-        .try_for_each(|dat| obj.define(dat.name.clone(), dat.data.clone()))?;
-
-    for link in start
-        .references
-        .iter()
-        .chain(sections.values().flat_map(|s| s.references.iter()))
-    {
-        if !externs.contains(&link.to)
-            && !defines.iter().any(|a| a.name == link.to)
-            && !sections.contains_key(&link.to)
-            && start.name != link.to
-        {
-            bail!("Undefined reference to {} at {}", link.to, link.from);
-        }
-    }
-
-    start
-        .references
-        .into_iter()
-        .try_for_each(|link| obj.link(link.to_link()))?;
-
-    sections.into_values().try_for_each(|v| {
-        v.references
-            .into_iter()
-            .try_for_each(|link| obj.link(link.to_link()))
-    })?;
-
-    // Finally, we write the object file
-    obj.write(out)?;
-    Ok(())
 }
 
 #[derive(Parser, Debug)]
@@ -1330,7 +1302,7 @@ impl Ref {
 #[derive(Debug, Clone, Eq)]
 pub struct Fun {
     name: String,
-    lines: Vec<Line>,
+    lines: Vec<LineStruct>,
     references: Vec<Ref>,
     bytecode: Vec<u8>,
 }
@@ -1351,42 +1323,52 @@ impl Fun {
     fn assemble(&mut self) -> Result<&mut Vec<u8>> {
         self.bytecode.clear();
 
-        const REX_W: u8 = 0x48;
-
         let lines = take(&mut self.lines);
         for line in lines.into_iter() {
-            if let Line::Mnemonic(mnemonic) = line {
-                let Mnemonic {
-                    name,
-                    mut operands,
-                    line: i,
-                } = mnemonic;
+            if let Err(e) = self.assemble_line(line.line) {
+                bail!("Error on line {}: {}", line.line_num, e);
+            }
+        }
 
-                match name {
-                    Mn::MOV => {
-                        if operands.len() != 2 {
-                            bail!("Error at line {}: MOV must have 2 operands", i);
+        Ok(&mut self.bytecode)
+    }
+
+    fn assemble_line(&mut self, line: Line) -> Result<()> {
+        const REX_W: u8 = 0x48;
+
+        if let Line::Mnemonic(mnemonic) = line {
+            let num_operands = mnemonic.num_args();
+
+            let Mnemonic { name, mut operands } = mnemonic;
+
+            match operands.len() {
+                2 => {
+                    if num_operands != 2 {
+                        bail!("Invalid number of arguments for {:?}", name);
+                    }
+
+                    let mut op2 = operands.pop().unwrap();
+                    let mut op1 = operands.pop().unwrap();
+
+                    let reverse_direction = matches!(op2, Operand::Register(_))
+                        && matches!(op1, Operand::EffectiveAddress(_));
+
+                    if reverse_direction {
+                        std::mem::swap(&mut op1, &mut op2);
+                    }
+
+                    if let Operand::Register(ref reg) = op1 {
+                        match Bits::from(*reg) {
+                            Bits::Bits64 => self.bytecode.push(REX_W),
+                            Bits::Bits16 => self.bytecode.push(0x66),
+                            _ => (),
                         }
 
-                        let mut op2 = operands.pop().unwrap();
-                        let mut op1 = operands.pop().unwrap();
+                        let vopcode = mnemonic.name.bytecode();
 
-                        let reverse_direction = matches!(op2, Operand::Register(_))
-                            && matches!(op1, Operand::EffectiveAddress(_));
+                        let mut opcode = vopcode[0][0];
 
-                        if reverse_direction {
-                            std::mem::swap(&mut op1, &mut op2);
-                        }
-
-                        if let Operand::Register(ref reg) = op1 {
-                            match Bits::from(*reg) {
-                                Bits::Bits64 => self.bytecode.push(REX_W),
-                                Bits::Bits16 => self.bytecode.push(0x66),
-                                _ => (),
-                            }
-
-                            let mut opcode = 0x88;
-
+                        if name != Mn::LEA {
                             if !matches!(op2, Operand::Symbol(_) | Operand::Immediate(_)) {
                                 if !matches!(reg.bits, Bits::Bits8) {
                                     opcode |= 0b0000_0001;
@@ -1396,495 +1378,130 @@ impl Fun {
                                     opcode |= 0b0000_0010;
                                 }
                             } else {
-                                opcode = 0xC7;
-                            }
-
-                            self.bytecode.push(opcode);
-                        }
-
-                        match (op1, op2) {
-                            (Operand::Register(reg1), Operand::Register(reg2)) => {
-                                let bytecode = reg2.into_bytecode(self, Some(reg1))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (Operand::Register(reg), Operand::Immediate(imm)) => {
-                                self.bytecode.push(0xc0 + u8::from(reg));
-                                self.bytecode
-                                    .extend_from_slice(&Vec::from(imm.into_imm(Bits::Bits32)?));
-                            }
-                            (Operand::Register(reg), Operand::EffectiveAddress(mem)) => {
-                                let bytecode = mem.into_bytecode(self, Some(reg))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (Operand::Register(reg), Operand::Symbol(sym)) => {
-                                self.bytecode.push(0xc0 + u8::from(reg));
-                                let bytecode = sym.into_bytecode(self, Some(reg))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (op1, op2) => {
-                                bail!(
-                                    "Error at line {}: Invalid operands for MOV ({:?}, {:?})",
-                                    i,
-                                    op1,
-                                    op2
-                                );
+                                opcode = vopcode[1][0];
                             }
                         }
+
+                        self.bytecode.push(opcode);
                     }
-                    Mn::CALL => {
-                        self.bytecode.push(0xe8);
 
-                        if let Operand::Symbol(sym) = &operands[0] {
-                            self.references.push(Ref {
-                                from: self.name.clone(),
-                                to: sym.name.clone(),
-                                at: self.bytecode.len() as u64,
-                            });
-                            self.bytecode.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-                        } else {
-                            bail!(
-                                "Error at line {}: Invalid operand for CALL, must be a symbol",
-                                i
-                            );
+                    match (op1, op2) {
+                        (Operand::Register(reg1), Operand::Register(reg2)) => {
+                            let bytecode = reg2.into_bytecode(self, Some(reg1))?;
+                            self.bytecode.extend_from_slice(&bytecode);
                         }
-                    }
-                    Mn::RET => {
-                        self.bytecode.push(0xc3);
-                    }
-                    Mn::PUSH => match &operands[0] {
-                        Operand::Register(reg) => {
-                            match u8::from(reg.bits) {
-                                64 => self.bytecode.push(REX_W),
-                                16 => self.bytecode.push(0x66),
-                                32 => {
-                                    bail!("Error at line {}: 32 bit mode not supported", i);
-                                }
-                                _ => (),
-                            }
-
-                            self.bytecode.push(0x50 + reg.reg as u8);
-                        }
-                        Operand::Immediate(num) => {
-                            self.bytecode.push(0x68);
+                        (Operand::Register(reg), Operand::Immediate(imm)) => {
+                            self.bytecode.push(0xc0 + u8::from(reg));
                             self.bytecode
-                                .extend_from_slice(&Vec::from(num.into_imm(Bits::Bits32)?));
+                                .extend_from_slice(&Vec::from(imm.into_imm(Bits::Bits32)?));
                         }
-                        _ => {
-                            bail!("Error at line {}: Invalid operand for PUSH", i);
+                        (Operand::Register(reg), Operand::EffectiveAddress(mem)) => {
+                            let bytecode = mem.into_bytecode(self, Some(reg))?;
+                            self.bytecode.extend_from_slice(&bytecode);
                         }
-                    },
-                    Mn::POP => {
-                        let op = operands
-                            .pop()
-                            .context(anyhow!("Error at line {}: POP must have 1 operand", i))?;
-
-                        match op {
-                            Operand::Register(reg) => {
-                                match Bits::from(reg) {
-                                    Bits::Bits64 => self.bytecode.push(REX_W),
-                                    Bits::Bits16 => self.bytecode.push(0x66),
-                                    Bits::Bits32 => {
-                                        bail!("Error at line {}: 32 bit mode not supported", i);
-                                    }
-                                    _ => (),
-                                }
-
-                                self.bytecode.push(0x58 + reg.reg as u8);
-                            }
-                            _ => {
-                                bail!("Error at line {}: Invalid operand for POP", i);
-                            }
+                        (Operand::Register(reg), Operand::Symbol(sym)) => {
+                            self.bytecode.push(0xc0 + u8::from(reg));
+                            let bytecode = sym.into_bytecode(self, Some(reg))?;
+                            self.bytecode.extend_from_slice(&bytecode);
+                        }
+                        (op1, op2) => {
+                            bail!("Invalid operands for {:?} ({:?}, {:?})", name, op1, op2);
                         }
                     }
-                    Mn::ADD => {
-                        if operands.len() != 2 {
-                            bail!("Error at line {}: ADD must have 2 operands", i);
-                        }
-
-                        let mut op2 = operands.pop().unwrap();
-                        let mut op1 = operands.pop().unwrap();
-
-                        let reverse_direction = matches!(op2, Operand::Register(_))
-                            && matches!(op1, Operand::EffectiveAddress(_));
-
-                        if reverse_direction {
-                            std::mem::swap(&mut op1, &mut op2);
-                        }
-
-                        if let Operand::Register(ref reg) = op1 {
-                            match Bits::from(*reg) {
-                                Bits::Bits64 => self.bytecode.push(REX_W),
-                                Bits::Bits16 => self.bytecode.push(0x66),
-                                _ => (),
-                            }
-
-                            let mut opcode = 0x00;
-
-                            if !matches!(op2, Operand::Symbol(_) | Operand::Immediate(_)) {
-                                if !matches!(reg.bits, Bits::Bits8) {
-                                    opcode |= 0b0000_0001;
-                                }
-
-                                if !reverse_direction {
-                                    opcode |= 0b0000_0010;
-                                }
-                            } else {
-                                opcode = 0x81;
-                            }
-
-                            self.bytecode.push(opcode);
-                        }
-
-                        match (op1, op2) {
-                            (Operand::Register(reg1), Operand::Register(reg2)) => {
-                                let bytecode = reg2.into_bytecode(self, Some(reg1))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (Operand::Register(reg), Operand::Immediate(imm)) => {
-                                self.bytecode.push(0xc0 + u8::from(reg));
-                                self.bytecode
-                                    .extend_from_slice(&Vec::from(imm.into_imm(Bits::Bits32)?));
-                            }
-                            (Operand::Register(reg), Operand::EffectiveAddress(mem)) => {
-                                let bytecode = mem.into_bytecode(self, Some(reg))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (Operand::Register(reg), Operand::Symbol(sym)) => {
-                                self.bytecode.push(0xc0 + u8::from(reg));
-                                let bytecode = sym.into_bytecode(self, Some(reg))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (op1, op2) => {
-                                bail!(
-                                    "Error at line {}: Invalid operands for ADD ({:?}, {:?})",
-                                    i,
-                                    op1,
-                                    op2
-                                );
-                            }
-                        }
+                }
+                1 => {
+                    if num_operands != 1 {
+                        bail!("Invalid number of arguments for {:?}", name);
                     }
-                    Mn::SUB => {
-                        if operands.len() != 2 {
-                            bail!("Error at line {}: SUB must have 2 operands", i);
-                        }
 
-                        let mut op2 = operands.pop().unwrap();
-                        let mut op1 = operands.pop().unwrap();
+                    let op1 = operands.pop().unwrap();
 
-                        let reverse_direction = matches!(op2, Operand::Register(_))
-                            && matches!(op1, Operand::EffectiveAddress(_));
-
-                        if reverse_direction {
-                            std::mem::swap(&mut op1, &mut op2);
-                        }
-
-                        if let Operand::Register(ref reg) = op1 {
-                            match Bits::from(*reg) {
-                                Bits::Bits64 => self.bytecode.push(REX_W),
-                                Bits::Bits16 => self.bytecode.push(0x66),
-                                _ => (),
-                            }
-
-                            let mut opcode = 0x2b;
-
-                            if !matches!(op2, Operand::Symbol(_) | Operand::Immediate(_)) {
-                                if !matches!(reg.bits, Bits::Bits8) {
-                                    opcode |= 0b0000_0010;
-                                }
-
-                                if !reverse_direction {
-                                    opcode |= 0b0000_0001;
-                                }
-                            } else {
-                                opcode = 0x81;
-                            }
-
-                            self.bytecode.push(opcode);
-                        }
-
-                        match (op1, op2) {
-                            (Operand::Register(reg1), Operand::Register(reg2)) => {
-                                let bytecode = reg2.into_bytecode(self, Some(reg1))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (Operand::Register(reg), Operand::Immediate(imm)) => {
-                                self.bytecode.push(0xe8 + u8::from(reg));
-                                self.bytecode
-                                    .extend_from_slice(&Vec::from(imm.into_imm(Bits::Bits32)?));
-                            }
-                            (Operand::Register(reg), Operand::EffectiveAddress(mem)) => {
-                                let bytecode = mem.into_bytecode(self, Some(reg))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (Operand::Register(reg), Operand::Symbol(sym)) => {
-                                self.bytecode.push(0xe8 + u8::from(reg));
-                                let bytecode = sym.into_bytecode(self, Some(reg))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (op1, op2) => {
-                                bail!(
-                                    "Error at line {}: Invalid operands for SUB ({:?}, {:?})",
-                                    i,
-                                    op1,
-                                    op2
-                                );
-                            }
-                        }
-                    }
-                    Mn::MUL => {}
-                    Mn::DIV => {}
-                    Mn::Jump(jmp) => {
-                        if operands.len() != 1 {
-                            bail!("Error at line {}: {:?} must have 1 operand", i, jmp);
-                        }
-
-                        let op = operands.pop().unwrap();
-
+                    if let Mn::Jump(jmp) = name {
                         if matches!(jmp, Jump::JMP) {
                             self.bytecode.push(0xe9);
                         } else {
                             self.bytecode.extend_from_slice(&[0x0f, jmp as u8]);
                         }
 
-                        if let Operand::Symbol(sym) = op {
+                        if let Operand::Symbol(sym) = op1 {
                             let bytecode = sym.into_bytecode(self, None)?;
                             self.bytecode.extend_from_slice(&bytecode);
                         } else {
-                            bail!("Error at line {}: Invalid operand for JE", i);
+                            bail!("Invalid operand for {:?}", name);
                         }
-                    }
-                    Mn::CMP => {
-                        if operands.len() != 2 {
-                            bail!("Error at line {}: ADD must have 2 operands", i);
-                        }
-
-                        let mut op2 = operands.pop().unwrap();
-                        let mut op1 = operands.pop().unwrap();
-
-                        let reverse_direction = matches!(op2, Operand::Register(_))
-                            && matches!(op1, Operand::EffectiveAddress(_));
-
-                        if reverse_direction {
-                            std::mem::swap(&mut op1, &mut op2);
-                        }
-
-                        if let Operand::Register(ref reg) = op1 {
-                            match Bits::from(*reg) {
-                                Bits::Bits64 => self.bytecode.push(REX_W),
-                                Bits::Bits16 => self.bytecode.push(0x66),
-                                _ => (),
-                            }
-
-                            let mut opcode = 0x39;
-
-                            if !matches!(op2, Operand::Symbol(_) | Operand::Immediate(_)) {
-                                if !matches!(reg.bits, Bits::Bits8) {
-                                    opcode |= 0b0000_0001;
-                                }
-
-                                if !reverse_direction {
-                                    opcode |= 0b0000_0010;
-                                }
-                            } else {
-                                opcode = 0x81;
-                            }
-
-                            self.bytecode.push(opcode);
-                        }
-
-                        match (op1, op2) {
-                            (Operand::Register(reg1), Operand::Register(reg2)) => {
-                                let bytecode = reg2.into_bytecode(self, Some(reg1))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (Operand::Register(reg), Operand::Immediate(imm)) => {
-                                self.bytecode.push(0xc0 + u8::from(reg));
-                                self.bytecode
-                                    .extend_from_slice(&Vec::from(imm.into_imm(Bits::Bits32)?));
-                            }
-                            (Operand::Register(reg), Operand::EffectiveAddress(mem)) => {
-                                let bytecode = mem.into_bytecode(self, Some(reg))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (Operand::Register(reg), Operand::Symbol(sym)) => {
-                                self.bytecode.push(0xc0 + u8::from(reg));
-                                let bytecode = sym.into_bytecode(self, Some(reg))?;
-                                self.bytecode.extend_from_slice(&bytecode);
-                            }
-                            (op1, op2) => {
-                                bail!(
-                                    "Error at line {}: Invalid operands for operands for operands for CMP ({:?}, {:?})",
-                                    i,
-                                    op1,
-                                    op2
-                                );
-                            }
-                        }
-                    }
-                    Mn::LEA => {
-                        if operands.len() != 2 {
-                            bail!("Error at line {}: LEA must have 2 operands", i);
-                        }
-
-                        let op2 = operands.pop().unwrap();
-                        let op1 = operands.pop().unwrap();
-
-                        if let Operand::Register(ref reg) = op1 {
-                            match Bits::from(*reg) {
-                                Bits::Bits64 => self.bytecode.push(REX_W),
-                                Bits::Bits16 => self.bytecode.push(0x66),
-                                _ => (),
-                            }
-
-                            let opcode = 0x8d;
-                            self.bytecode.push(opcode);
-                        }
-
-                        match (op1, op2) {
-                            (Operand::Register(reg), Operand::EffectiveAddress(mem)) => {
-                                let mut extender = vec![];
-
-                                let mut modrm = 0b00_000_000;
-                                modrm += u8::from(reg) << 3;
-
-                                let mut sib = 0b00_000_000;
-                                sib |= u8::from(mem.base);
-                                sib |= u8::from(mem.index) << 3;
-                                sib |= u8::from(mem.scale) << 6;
-
-                                let imm =
-                                    Immediate::from(mem.displacement).into_imm(Bits::Bits32)?;
-
-                                if let Some(sym) = mem.symbol {
-                                    modrm |= u8::from(mem.base);
-                                    self.bytecode.push(modrm);
-                                    let bytecode = sym.into_bytecode(self, Some(reg))?;
-                                    self.bytecode.extend_from_slice(&bytecode);
-                                    continue;
-                                } else if mem.base == RegisterName::IP
-                                    || mem.index == RegisterName::SP
-                                {
-                                    if mem.index == RegisterName::SP {
-                                        modrm |= 0b10_000_000;
-                                    }
-                                    modrm |= u8::from(mem.base);
-                                    extender.push(modrm);
-                                    extender.extend_from_slice(&Vec::from(imm));
-                                } else if matches!(mem.typ, EffectiveAddressType::OnlyBase) {
-                                    modrm |= u8::from(mem.base);
-                                    extender.push(modrm);
-                                } else {
-                                    if !matches!(mem.typ, EffectiveAddressType::OnlyDisplacement) {
-                                        modrm |= 0b10_000_100;
-                                    }
-
-                                    extender.push(modrm);
-                                    extender.push(sib);
-                                    extender.extend_from_slice(&Vec::from(imm));
-                                }
-
-                                self.bytecode.extend_from_slice(&extender);
-                            }
-                            (op1, op2) => {
-                                bail!(
-                                    "Error at line {}: Invalid operands for LEA ({:?}, {:?})",
-                                    i,
-                                    op1,
-                                    op2
-                                );
-                            }
-                        }
-                    }
-                    Mn::NOP => {}
-                    Mn::INC => {
-                        let op = operands
-                            .pop()
-                            .context(anyhow!("Error at line {}: POP must have 1 operand", i))?;
-
-                        match op {
-                            Operand::Register(reg) => {
-                                match Bits::from(reg) {
-                                    Bits::Bits64 => self.bytecode.push(REX_W),
-                                    Bits::Bits16 => self.bytecode.push(0x66),
-                                    Bits::Bits32 => {
-                                        bail!("Error at line {}: 32 bit mode not supported", i);
-                                    }
-                                    _ => (),
-                                }
-
-                                let opcode = 0xff;
-                                self.bytecode.push(opcode);
-                                self.bytecode.push(0xc0 + u8::from(reg));
-                            }
-                            _ => {
-                                bail!("Error at line {}: Invalid operand for POP", i);
-                            }
-                        }
-                    }
-                    Mn::DEC => {
-                        let op = operands
-                            .pop()
-                            .context(anyhow!("Error at line {}: POP must have 1 operand", i))?;
-
-                        match op {
-                            Operand::Register(reg) => {
-                                match Bits::from(reg) {
-                                    Bits::Bits64 => self.bytecode.push(REX_W),
-                                    Bits::Bits16 => self.bytecode.push(0x66),
-                                    Bits::Bits32 => {
-                                        bail!("Error at line {}: 32 bit mode not supported", i);
-                                    }
-                                    _ => (),
-                                }
-
-                                let opcode = 0xff;
-                                self.bytecode.push(opcode);
-                                self.bytecode.push(0xc8 + u8::from(reg));
-                            }
-                            _ => {
-                                bail!("Error at line {}: Invalid operand for POP", i);
-                            }
-                        }
-                    }
-                    Mn::INT => {
-                        self.bytecode.push(0xcd);
-
-                        if let Operand::Immediate(num) = &operands[0] {
-                            self.bytecode.push(Vec::from(num.into_imm(Bits::Bits8)?)[0]);
-                        } else {
-                            bail!("Error at line {}: Invalid operand for INT", i);
-                        }
+                        return Ok(());
                     }
 
-                    Mn::SYSCALL => self.bytecode.extend_from_slice(&[0x0F, 0x05]),
+                    let vopcode = mnemonic.name.bytecode();
+
+                    if let Operand::Register(ref reg) = op1 {
+                        match Bits::from(*reg) {
+                            Bits::Bits64 => self.bytecode.push(REX_W),
+                            Bits::Bits16 => self.bytecode.push(0x66),
+                            _ => (),
+                        }
+
+                        let mut opcode = vopcode[0][0];
+
+                        if !matches!(op1, Operand::Symbol(_) | Operand::Immediate(_))
+                            && !matches!(reg.bits, Bits::Bits8)
+                        {
+                            opcode |= 0b0000_0001;
+                        }
+
+                        self.bytecode.push(opcode);
+                    } else if let Operand::Symbol(sym) = op1 {
+                        self.bytecode.extend_from_slice(&vopcode[0]);
+                        self.references.push(Ref {
+                            from: self.name.clone(),
+                            to: sym.name,
+                            at: self.bytecode.len() as u64,
+                        });
+                        self.bytecode.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                    } else {
+                        bail!("Invalid operand for {:?}", name);
+                    }
+                }
+                0 => {
+                    if num_operands != 0 {
+                        bail!("Invalid number of arguments for {:?}", name);
+                    }
+
+                    let opcode = mnemonic.name.bytecode();
+                    self.bytecode.extend_from_slice(&opcode[0]);
+                }
+                _ => {
+                    bail!("Invalid number of arguments for {:?}", name);
                 }
             }
         }
 
-        Ok(&mut self.bytecode)
+        Ok(())
     }
 }
 
-fn get_segments(input: &str) -> Result<Vec<Line>> {
+fn get_segments(input: &str) -> Result<Vec<LineStruct>> {
     let mut result = Vec::new();
 
     for (i, line) in input.lines().enumerate() {
         match Line::from_str(line.trim()) {
             Ok(parsed) => match parsed {
-                Line::DataDefine(_) => {
-                    result.push(parsed);
+                Line::DataDefine(_) | Line::Extern(_) | Line::Function(_) => {
+                    result.push(LineStruct {
+                        line: parsed,
+                        line_num: i,
+                    });
                 }
-                Line::Extern(_) => {
-                    result.push(parsed);
-                }
-                Line::Function(_) => {
-                    result.push(parsed);
-                }
-                Line::Mnemonic(mut mnemonic) => {
-                    if let Some(Line::Function(fun)) = result.last_mut() {
-                        mnemonic.line = i + 1;
-                        fun.lines.push(Line::Mnemonic(mnemonic));
+                Line::Mnemonic(mnemonic) => {
+                    if let Some(LineStruct {
+                        line: Line::Function(fun),
+                        ..
+                    }) = result.last_mut()
+                    {
+                        fun.lines.push(LineStruct {
+                            line: Line::Mnemonic(mnemonic),
+                            line_num: i,
+                        });
                     } else {
                         bail!(
                             "Mnemonic outside of function at line {}:\n\n    {}\n",
@@ -1929,12 +1546,17 @@ fn main() -> Result<()> {
     let mut data_define = HashSet::new();
     let mut exts = HashSet::new();
     let mut functions = HashSet::new();
-    for section in sections.into_iter() {
+    for LineStruct {
+        line: section,
+        line_num,
+    } in sections.into_iter()
+    {
         match section {
             Line::DataDefine(data) => {
                 let name = data.name.clone();
                 if !data_define.insert(data) {
-                    bail!("Error: Duplicate data definition: {}", name)
+                    eprintln!("Error at {}: Duplicate data definition: {}", line_num, name);
+                    std::process::exit(1);
                 }
             }
             Line::Extern(ext) => {
@@ -1954,12 +1576,16 @@ fn main() -> Result<()> {
 
                 let name = fun.name.clone();
                 if !functions.insert(fun) {
-                    bail!("Error: Duplicate function definition: {}", name)
+                    eprintln!(
+                        "Error at {}: Duplicate function definition: {}",
+                        line_num, name
+                    );
+                    std::process::exit(1);
                 }
             }
             _ => {}
         }
     }
 
-    generate_elf(out, functions, data_define, exts)
+    elf::generate(out, functions, data_define, exts)
 }
