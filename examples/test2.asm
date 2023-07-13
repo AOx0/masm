@@ -1,5 +1,6 @@
 extern printf
 extern scanf
+extern exit
 
 numb dw 0x0
 omsg db "The number is: %d", 0xa, 0
@@ -21,10 +22,4 @@ main:
     mov rsi, [rip + numb]
     call printf
 
-    jmp exit
-
-
-exit:
-    mov rax, 0x3c
-    mov rdi, 0
-    syscall
+    call exit
