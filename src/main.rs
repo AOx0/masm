@@ -442,8 +442,6 @@ impl Immediate {
 
     fn parse(inp: &str) -> Result<Immediate> {
         let inp = inp.trim();
-        println!("parsing {:?}", inp);
-
         if inp.starts_with("0x") {
             Self::parse_hex_0x(inp)
         } else if inp.ends_with('h') || inp.ends_with('H') {
@@ -453,7 +451,6 @@ impl Immediate {
         } else if inp.ends_with('b') || inp.ends_with('B') {
             Self::parse_bin_b(inp)
         } else if inp.starts_with('\'') {
-            println!("char literal");
             let c = inp.trim_matches('\'');
 
             if c.len() == 1 {
@@ -936,7 +933,6 @@ enum Mn {
     LEA = 0x8D,
     NOP = 0x90,
     INT = 0xCD,
-    LOOP = 0xE2,
     INC = 0x40,
     DEC = 0x48,
     SYSCALL,
@@ -945,7 +941,7 @@ enum Mn {
 
 #[derive(Debug, Clone, Copy)]
 enum Jump {
-    JMP = 0xE9,
+    JMP = 0xFF,
     JE = 0x84,
     JA = 0x87,
     JAE = 0x83,
@@ -963,7 +959,7 @@ impl FromStr for Jump {
             "JMP" => Ok(Jump::JMP),
             "JE" | "JZ" => Ok(Jump::JE),
             "JA" => Ok(Jump::JA),
-            "JNE" => Ok(Jump::JNE),
+            "JNE" | "JNZ" => Ok(Jump::JNE),
             "JG" => Ok(Jump::JG),
             "JGE" => Ok(Jump::JGE),
             "JL" => Ok(Jump::JL),
@@ -995,7 +991,6 @@ impl FromStr for Mn {
             "NOP" => Ok(Mn::NOP),
             "INT" => Ok(Mn::INT),
             "SYSCALL" => Ok(Mn::SYSCALL),
-            "LOOP" => Ok(Mn::LOOP),
             "INC" => Ok(Mn::INC),
             "DEC" => Ok(Mn::DEC),
             _ => Err(anyhow!("Invalid mnemonic: {}", inp)),
@@ -1221,8 +1216,6 @@ fn generate_elf(
         },
     };
     let mut obj = ArtifactBuilder::new(target).name(name.to_owned()).finish();
-    println!("Defines: {:?}", defines);
-
     let mut sections: HashMap<String, Fun> =
         HashMap::from_iter(functions.into_iter().map(|a| (a.name.clone(), a)));
 
@@ -1341,10 +1334,10 @@ impl Fun {
     fn assemble(&mut self) -> Result<&mut Vec<u8>> {
         self.bytecode.clear();
 
-        static REX_V: u8 = 0x40;
-        static REX_X: u8 = 0x42;
-        static REX_B: u8 = 0x44;
-        static REX_W: u8 = 0x48;
+        const REX_V: u8 = 0x40;
+        const REX_X: u8 = 0x42;
+        const REX_B: u8 = 0x44;
+        const REX_W: u8 = 0x48;
 
         let lines = take(&mut self.lines);
         for line in lines.into_iter() {
@@ -1354,6 +1347,7 @@ impl Fun {
                     mut operands,
                     line: i,
                 } = mnemonic;
+
                 match name {
                     Mn::MOV => {
                         if operands.len() != 2 {
@@ -1365,18 +1359,20 @@ impl Fun {
 
                         let reverse_direction = matches!(op2, Operand::Register(_))
                             && matches!(op1, Operand::EffectiveAddress(_));
+
                         if reverse_direction {
-                            std::mem::swap(&mut op1, &mut op2)
+                            std::mem::swap(&mut op1, &mut op2);
                         }
 
                         if let Operand::Register(ref reg) = op1 {
-                            if Bits::from(*reg) == 64 {
-                                self.bytecode.push(REX_W);
-                            } else if Bits::from(*reg) == 16 {
-                                self.bytecode.push(0x66);
+                            match Bits::from(*reg) {
+                                Bits::Bits64 => self.bytecode.push(REX_W),
+                                Bits::Bits16 => self.bytecode.push(0x66),
+                                _ => (),
                             }
 
                             let mut opcode = 0x88;
+
                             if !matches!(op2, Operand::Symbol(_) | Operand::Immediate(_)) {
                                 if !matches!(reg.bits, Bits::Bits8) {
                                     opcode |= 0b0000_0001;
@@ -1411,16 +1407,19 @@ impl Fun {
                                 let bytecode = sym.into_bytecode(self, Some(reg))?;
                                 self.bytecode.extend_from_slice(&bytecode);
                             }
-                            _ => {
+                            (op1, op2) => {
                                 return Err(anyhow!(
-                                    "Error at line {}: Invalid operands for MOV",
-                                    i
+                                    "Error at line {}: Invalid operands for MOV ({:?}, {:?})",
+                                    i,
+                                    op1,
+                                    op2
                                 ))
                             }
                         }
                     }
                     Mn::CALL => {
                         self.bytecode.push(0xe8);
+
                         if let Operand::Symbol(sym) = &operands[0] {
                             self.references.push(Ref {
                                 from: self.name.clone(),
@@ -1440,15 +1439,16 @@ impl Fun {
                     }
                     Mn::PUSH => match &operands[0] {
                         Operand::Register(reg) => {
-                            if reg.bits as u8 == 64 {
-                                self.bytecode.push(REX_W);
-                            } else if reg.bits as u8 == 16 {
-                                self.bytecode.push(0x66);
-                            } else if reg.bits as u8 == 32 {
-                                return Err(anyhow!(
-                                    "Error at line {}: 32 bit mode not supported",
-                                    i
-                                ));
+                            match u8::from(reg.bits) {
+                                64 => self.bytecode.push(REX_W),
+                                16 => self.bytecode.push(0x66),
+                                32 => {
+                                    return Err(anyhow!(
+                                        "Error at line {}: 32 bit mode not supported",
+                                        i
+                                    ));
+                                }
+                                _ => (),
                             }
 
                             self.bytecode.push(0x50 + reg.reg as u8);
@@ -1469,15 +1469,16 @@ impl Fun {
 
                         match op {
                             Operand::Register(reg) => {
-                                if Bits::from(reg) == 64 {
-                                    self.bytecode.push(REX_W);
-                                } else if Bits::from(reg) == 16 {
-                                    self.bytecode.push(0x66);
-                                } else if reg.bits as u8 == 32 {
-                                    return Err(anyhow!(
-                                        "Error at line {}: 32 bit mode not supported",
-                                        i
-                                    ));
+                                match Bits::from(reg) {
+                                    Bits::Bits64 => self.bytecode.push(REX_W),
+                                    Bits::Bits16 => self.bytecode.push(0x66),
+                                    Bits::Bits32 => {
+                                        return Err(anyhow!(
+                                            "Error at line {}: 32 bit mode not supported",
+                                            i
+                                        ));
+                                    }
+                                    _ => (),
                                 }
 
                                 self.bytecode.push(0x58 + reg.reg as u8);
@@ -1500,18 +1501,20 @@ impl Fun {
 
                         let reverse_direction = matches!(op2, Operand::Register(_))
                             && matches!(op1, Operand::EffectiveAddress(_));
+
                         if reverse_direction {
-                            std::mem::swap(&mut op1, &mut op2)
+                            std::mem::swap(&mut op1, &mut op2);
                         }
 
                         if let Operand::Register(ref reg) = op1 {
-                            if Bits::from(*reg) == 64 {
-                                self.bytecode.push(REX_W);
-                            } else if Bits::from(*reg) == 16 {
-                                self.bytecode.push(0x66);
+                            match Bits::from(*reg) {
+                                Bits::Bits64 => self.bytecode.push(REX_W),
+                                Bits::Bits16 => self.bytecode.push(0x66),
+                                _ => (),
                             }
 
                             let mut opcode = 0x00;
+
                             if !matches!(op2, Operand::Symbol(_) | Operand::Immediate(_)) {
                                 if !matches!(reg.bits, Bits::Bits8) {
                                     opcode |= 0b0000_0001;
@@ -1546,10 +1549,12 @@ impl Fun {
                                 let bytecode = sym.into_bytecode(self, Some(reg))?;
                                 self.bytecode.extend_from_slice(&bytecode);
                             }
-                            _ => {
+                            (op1, op2) => {
                                 return Err(anyhow!(
-                                    "Error at line {}: Invalid operands for ADD",
-                                    i
+                                    "Error at line {}: Invalid operands for ADD ({:?}, {:?})",
+                                    i,
+                                    op1,
+                                    op2
                                 ))
                             }
                         }
@@ -1564,18 +1569,20 @@ impl Fun {
 
                         let reverse_direction = matches!(op2, Operand::Register(_))
                             && matches!(op1, Operand::EffectiveAddress(_));
+
                         if reverse_direction {
-                            std::mem::swap(&mut op1, &mut op2)
+                            std::mem::swap(&mut op1, &mut op2);
                         }
 
                         if let Operand::Register(ref reg) = op1 {
-                            if Bits::from(*reg) == 64 {
-                                self.bytecode.push(REX_W);
-                            } else if Bits::from(*reg) == 16 {
-                                self.bytecode.push(0x66);
+                            match Bits::from(*reg) {
+                                Bits::Bits64 => self.bytecode.push(REX_W),
+                                Bits::Bits16 => self.bytecode.push(0x66),
+                                _ => (),
                             }
 
                             let mut opcode = 0x2b;
+
                             if !matches!(op2, Operand::Symbol(_) | Operand::Immediate(_)) {
                                 if !matches!(reg.bits, Bits::Bits8) {
                                     opcode |= 0b0000_0010;
@@ -1610,10 +1617,12 @@ impl Fun {
                                 let bytecode = sym.into_bytecode(self, Some(reg))?;
                                 self.bytecode.extend_from_slice(&bytecode);
                             }
-                            _ => {
+                            (op1, op2) => {
                                 return Err(anyhow!(
-                                    "Error at line {}: Invalid operands for SUB",
-                                    i
+                                    "Error at line {}: Invalid operands for SUB ({:?}, {:?})",
+                                    i,
+                                    op1,
+                                    op2
                                 ))
                             }
                         }
@@ -1631,7 +1640,12 @@ impl Fun {
 
                         let op = operands.pop().unwrap();
 
-                        self.bytecode.extend_from_slice(&[0x0f, jmp as u8]);
+                        if matches!(jmp, Jump::JMP) {
+                            self.bytecode.push(0xe9);
+                        } else {
+                            self.bytecode.extend_from_slice(&[0x0f, jmp as u8]);
+                        }
+
                         if let Operand::Symbol(sym) = op {
                             let bytecode = sym.into_bytecode(self, None)?;
                             self.bytecode.extend_from_slice(&bytecode);
@@ -1649,18 +1663,20 @@ impl Fun {
 
                         let reverse_direction = matches!(op2, Operand::Register(_))
                             && matches!(op1, Operand::EffectiveAddress(_));
+
                         if reverse_direction {
-                            std::mem::swap(&mut op1, &mut op2)
+                            std::mem::swap(&mut op1, &mut op2);
                         }
 
                         if let Operand::Register(ref reg) = op1 {
-                            if Bits::from(*reg) == 64 {
-                                self.bytecode.push(REX_W);
-                            } else if Bits::from(*reg) == 16 {
-                                self.bytecode.push(0x66);
+                            match Bits::from(*reg) {
+                                Bits::Bits64 => self.bytecode.push(REX_W),
+                                Bits::Bits16 => self.bytecode.push(0x66),
+                                _ => (),
                             }
 
                             let mut opcode = 0x39;
+
                             if !matches!(op2, Operand::Symbol(_) | Operand::Immediate(_)) {
                                 if !matches!(reg.bits, Bits::Bits8) {
                                     opcode |= 0b0000_0001;
@@ -1695,10 +1711,12 @@ impl Fun {
                                 let bytecode = sym.into_bytecode(self, Some(reg))?;
                                 self.bytecode.extend_from_slice(&bytecode);
                             }
-                            _ => {
+                            (op1, op2) => {
                                 return Err(anyhow!(
-                                    "Error at line {}: Invalid operands for ADD",
-                                    i
+                                    "Error at line {}: Invalid operands for operands for operands for CMP ({:?}, {:?})",
+                                    i,
+                                    op1,
+                                    op2
                                 ))
                             }
                         }
@@ -1712,10 +1730,10 @@ impl Fun {
                         let op1 = operands.pop().unwrap();
 
                         if let Operand::Register(ref reg) = op1 {
-                            if Bits::from(*reg) == 64 {
-                                self.bytecode.push(REX_W);
-                            } else if Bits::from(*reg) == 16 {
-                                self.bytecode.push(0x66);
+                            match Bits::from(*reg) {
+                                Bits::Bits64 => self.bytecode.push(REX_W),
+                                Bits::Bits16 => self.bytecode.push(0x66),
+                                _ => (),
                             }
 
                             let opcode = 0x8d;
@@ -1767,10 +1785,12 @@ impl Fun {
 
                                 self.bytecode.extend_from_slice(&extender);
                             }
-                            _ => {
+                            (op1, op2) => {
                                 return Err(anyhow!(
-                                    "Error at line {}: Invalid operands for LEA",
-                                    i
+                                    "Error at line {}: Invalid operands for LEA ({:?}, {:?})",
+                                    i,
+                                    op1,
+                                    op2
                                 ))
                             }
                         }
@@ -1783,18 +1803,21 @@ impl Fun {
 
                         match op {
                             Operand::Register(reg) => {
-                                if Bits::from(reg) == 64 {
-                                    self.bytecode.push(REX_W);
-                                } else if Bits::from(reg) == 16 {
-                                    self.bytecode.push(0x66);
-                                } else if reg.bits as u8 == 32 {
-                                    return Err(anyhow!(
-                                        "Error at line {}: 32 bit mode not supported",
-                                        i
-                                    ));
+                                match Bits::from(reg) {
+                                    Bits::Bits64 => self.bytecode.push(REX_W),
+                                    Bits::Bits16 => self.bytecode.push(0x66),
+                                    Bits::Bits32 => {
+                                        return Err(anyhow!(
+                                            "Error at line {}: 32 bit mode not supported",
+                                            i
+                                        ));
+                                    }
+                                    _ => (),
                                 }
 
-                                self.bytecode.push(0x58 + reg.reg as u8);
+                                let opcode = 0xff;
+                                self.bytecode.push(opcode);
+                                self.bytecode.push(0xc0 + u8::from(reg));
                             }
                             _ => {
                                 return Err(anyhow!(
@@ -1811,18 +1834,21 @@ impl Fun {
 
                         match op {
                             Operand::Register(reg) => {
-                                if Bits::from(reg) == 64 {
-                                    self.bytecode.push(REX_W);
-                                } else if Bits::from(reg) == 16 {
-                                    self.bytecode.push(0x66);
-                                } else if reg.bits as u8 == 32 {
-                                    return Err(anyhow!(
-                                        "Error at line {}: 32 bit mode not supported",
-                                        i
-                                    ));
+                                match Bits::from(reg) {
+                                    Bits::Bits64 => self.bytecode.push(REX_W),
+                                    Bits::Bits16 => self.bytecode.push(0x66),
+                                    Bits::Bits32 => {
+                                        return Err(anyhow!(
+                                            "Error at line {}: 32 bit mode not supported",
+                                            i
+                                        ));
+                                    }
+                                    _ => (),
                                 }
 
-                                self.bytecode.push(0x48 + reg.reg as u8);
+                                let opcode = 0xff;
+                                self.bytecode.push(opcode);
+                                self.bytecode.push(0xc8 + u8::from(reg));
                             }
                             _ => {
                                 return Err(anyhow!(
@@ -1834,22 +1860,14 @@ impl Fun {
                     }
                     Mn::INT => {
                         self.bytecode.push(0xcd);
+
                         if let Operand::Immediate(num) = &operands[0] {
                             self.bytecode.push(Vec::from(num.into_imm(Bits::Bits8)?)[0]);
                         } else {
                             return Err(anyhow!("Error at line {}: Invalid operand for INT", i));
                         }
                     }
-                    Mn::LOOP => {
-                        self.bytecode.push(REX_W);
-                        self.bytecode.push(0xe9);
-                        if let Some(Operand::Symbol(sym)) = &operands.get(0) {
-                            let bytecode = sym.clone().into_bytecode(self, None)?;
-                            self.bytecode.extend_from_slice(&bytecode);
-                        } else {
-                            return Err(anyhow!("Error at line {}: Invalid operand for LOOP", i));
-                        }
-                    }
+
                     Mn::SYSCALL => self.bytecode.extend_from_slice(&[0x0F, 0x05]),
                 }
             }

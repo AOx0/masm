@@ -1,17 +1,15 @@
-output db 0
-base db 2
-counter dw 1
-sum dw 0
-remainder db 0
-quotient dw 0
+extern printf
+
+fmt db "%d-", 0x0
 
 _start:
-    mov rax, 10000       ; numero decimal a convertir
+    mov rax, 10       ; numero decimal a convertir
     mov rdx, 2           ; base
     mov rcx, 1
     mov rbx, 0
     mov rsi, 1   ; nuestro contador para movernos por la memoria
     mov rdi, 0   ; nuestro contador de cuantas veces hemos sumado la base
+    jmp p1
 
 p1:
     cmp rdx, rax
@@ -24,15 +22,23 @@ p1:
 
     inc rdi
 
-    loop p1
-    call exit
+    push rax
+    mov rax, 0x0
+    lea rdi, [rip + fmt]
+    mov rsi, rcx
+    call printf
+    pop rax
+
+    dec rcx
+    jnz _start
+    jmp exit
 
 
 base_mayor_que_el_numero:
     mov [rsp], rax
     mov rax, 0x20
     mov rcx, rsi
-    call imprimir
+    jmp imprimir
 
 obtener_cociente_y_residuo:
     sub rbx, rdx
@@ -45,60 +51,63 @@ obtener_cociente_y_residuo:
     jmp p1
 
 es_mayor_a_diez:
-    cmp rdl, 10
+    cmp rdx, 10
     je es_diez
-    cmp rdl, 11
+    cmp rdx, 11
     je es_once
-    cmp rdl, 12
+    cmp rdx, 12
     je es_doce
-    cmp rdl, 13
+    cmp rdx, 13
     je es_trece
-    cmp rdl, 14
+    cmp rdx, 14
     je es_catorce
-    cmp rdl, 15
+    cmp rdx, 15
     je es_quince
 
 es_diez:
-    mov rdl, 'a'
+    mov rdx, 'a'
     jmp imprimir
 
 es_once:
-    mov rdl, 'b'
+    mov rdx, 'b'
     jmp imprimir
 
 es_doce:
-    mov rdl, 'c'
+    mov rdx, 'c'
     jmp imprimir
 
 es_trece:
-    mov dl, 'd'
+    mov rdx, 'd'
     jmp imprimir
 
 es_catorce:
-    mov dl, 'e'
+    mov rdx, 'e'
     jmp imprimir
 
 es_quince:
-    mov dl, 'f'
+    mov rdx, 'f'
     jmp imprimir
 
 
 imprimir:
     cmp rsi, 0
-    call exit
-    pop rdl
+    jmp exit
+    pop rdx
     dec rsi
-    cmp rdl, 10
+    cmp rdx, 10
     jae es_mayor_a_diez
-    add rdl, 48
+    add rdx, 48
 
-    ;; sys_write
-    mov rax, 0x01
-    mov rdi, rdl
-    mov rsi, 1
-    syscall
-    loop imprimir
+    ;; printf
+    push rax
+    mov rax, 0x0
+    lea rdi, [rip + fmt]
+    mov rsi, rdx
+    call printf
+    pop rax
 
+    dec rcx
+    jnz imprimir
 
 exit:
     mov rax, 0x3c
