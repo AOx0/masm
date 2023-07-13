@@ -2,8 +2,8 @@ use super::*;
 
 pub fn generate(
     out: File,
-    functions: HashSet<Fun>,
-    defines: HashSet<DataDefine>,
+    mut sections: HashMap<String, Fun>,
+    mut defines: HashMap<String, DataDefine>,
     externs: HashSet<String>,
 ) -> Result<()> {
     let name = "out.o";
@@ -20,24 +20,33 @@ pub fn generate(
         },
     };
     let mut obj = ArtifactBuilder::new(target).name(name.to_owned()).finish();
-    let mut sections: HashMap<String, Fun> =
-        HashMap::from_iter(functions.into_iter().map(|a| (a.name.clone(), a)));
 
-    let (_, start) = sections
-        .remove_entry("_start")
-        .context("main or _start must be defined")?;
+    let start = sections.remove_entry("_start");
+    let start = start.iter().map(|(_, data)| data).next();
 
-    obj.declarations(sections.keys().map(|name| (name, Decl::function().into())))?;
-    obj.declarations(
-        [("_start", Decl::function().global().into())]
-            .iter()
-            .cloned(),
-    )?;
-    obj.declarations(
-        defines
-            .iter()
-            .map(|dat| (dat.name.clone(), Decl::data().with_writable(true).into())),
-    )?;
+    obj.declarations(sections.values().map(|fun| {
+        if fun.global {
+            (fun.name.clone(), Decl::function().global().into())
+        } else {
+            (fun.name.clone(), Decl::function().into())
+        }
+    }))?;
+
+    if start.is_some() {
+        obj.declarations(
+            [("_start", Decl::function().global().into())]
+                .iter()
+                .cloned(),
+        )?;
+    }
+
+    obj.declarations(defines.iter().map(|(name, dat)| {
+        if dat.import {
+            (dat.name.clone(), Decl::data_import().into())
+        } else {
+            (dat.name.clone(), Decl::data().with_writable(true).into())
+        }
+    }))?;
     obj.declarations(
         externs
             .iter()
@@ -47,29 +56,33 @@ pub fn generate(
     sections
         .iter_mut()
         .try_for_each(|(name, sect)| obj.define(name, take(&mut sect.bytecode)))?;
-    obj.define("_start", start.bytecode)?;
-    defines
-        .iter()
-        .try_for_each(|dat| obj.define(dat.name.clone(), dat.data.clone()))?;
-
-    for link in start
-        .references
-        .iter()
-        .chain(sections.values().flat_map(|s| s.references.iter()))
-    {
-        if !externs.contains(&link.to)
-            && !defines.iter().any(|a| a.name == link.to)
-            && !sections.contains_key(&link.to)
-            && start.name != link.to
-        {
-            bail!("Undefined reference to {} at {}", link.to, link.from);
-        }
+    if let Some(ref start) = start {
+        obj.define("_start", start.bytecode.clone())?;
     }
+    defines
+        .iter_mut()
+        .try_for_each(|(name, dat)| obj.define(name.clone(), dat.data.clone()))?;
 
-    start
-        .references
-        .into_iter()
-        .try_for_each(|link| obj.link(link.to_link()))?;
+    if let Some(ref start) = start {
+        for link in start
+            .references
+            .iter()
+            .chain(sections.values().flat_map(|s| s.references.iter()))
+        {
+            if !externs.contains(&link.to)
+                && !defines.iter().any(|a| a.0.as_str() == link.to)
+                && !sections.contains_key(&link.to)
+                && start.name != link.to
+            {
+                bail!("Undefined reference to {} at {}", link.to, link.from);
+            }
+        }
+
+        start
+            .references
+            .iter()
+            .try_for_each(|link| obj.link(link.to_link()))?;
+    }
 
     sections.into_values().try_for_each(|v| {
         v.references

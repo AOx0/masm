@@ -1070,6 +1070,7 @@ impl FromStr for Mnemonic {
 pub struct DataDefine {
     name: String,
     data: Vec<u8>,
+    import: bool,
 }
 
 impl std::hash::Hash for DataDefine {
@@ -1145,6 +1146,7 @@ impl FromStr for DataDefine {
         Ok(DataDefine {
             name: name.to_string(),
             data: values,
+            import: false,
         })
     }
 }
@@ -1162,6 +1164,7 @@ enum Line {
     Extern(String),
     Comment(String),
     Function(Fun),
+    Global(String),
     Empty,
 }
 
@@ -1240,12 +1243,15 @@ impl FromStr for Line {
             Line::DataDefine(DataDefine::from_str(inp)?)
         } else if lower.trim_start().contains("extern") {
             Line::Extern(inp.trim_start_matches("extern").trim().to_string())
+        } else if lower.trim_start().contains("global") {
+            Line::Global(inp.trim_start_matches("global").trim().to_string())
         } else if is_function(inp).unwrap_or(false) {
             Line::Function(Fun {
                 name: inp.trim().trim_end_matches(':').to_string(),
                 lines: vec![],
                 references: vec![],
                 bytecode: vec![],
+                global: false,
             })
         } else {
             Line::Mnemonic(Mnemonic::from_str(inp)?)
@@ -1305,6 +1311,7 @@ pub struct Fun {
     lines: Vec<LineStruct>,
     references: Vec<Ref>,
     bytecode: Vec<u8>,
+    global: bool,
 }
 
 impl std::hash::Hash for Fun {
@@ -1486,7 +1493,7 @@ fn get_segments(input: &str) -> Result<Vec<LineStruct>> {
     for (i, line) in input.lines().enumerate() {
         match Line::from_str(line.trim()) {
             Ok(parsed) => match parsed {
-                Line::DataDefine(_) | Line::Extern(_) | Line::Function(_) => {
+                Line::DataDefine(_) | Line::Extern(_) | Line::Function(_) | Line::Global(_) => {
                     result.push(LineStruct {
                         line: parsed,
                         line_num: i,
@@ -1543,9 +1550,10 @@ fn main() -> Result<()> {
         }
     };
 
-    let mut data_define = HashSet::new();
+    let mut data_define = HashMap::new();
     let mut exts = HashSet::new();
-    let mut functions = HashSet::new();
+    let mut functions = HashMap::new();
+    let mut globals = HashSet::new();
     for LineStruct {
         line: section,
         line_num,
@@ -1554,7 +1562,7 @@ fn main() -> Result<()> {
         match section {
             Line::DataDefine(data) => {
                 let name = data.name.clone();
-                if !data_define.insert(data) {
+                if data_define.insert(name.clone(), data).is_some() {
                     eprintln!("Error at {}: Duplicate data definition: {}", line_num, name);
                     std::process::exit(1);
                 }
@@ -1575,7 +1583,7 @@ fn main() -> Result<()> {
                 }
 
                 let name = fun.name.clone();
-                if !functions.insert(fun) {
+                if functions.insert(name.clone(), fun).is_some() {
                     eprintln!(
                         "Error at {}: Duplicate function definition: {}",
                         line_num, name
@@ -1583,9 +1591,25 @@ fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             }
-            _ => {}
+            Line::Global(global) => {
+                globals.insert(global);
+            }
+            Line::Mnemonic(_) => {}
+            Line::Comment(_) => {}
+            Line::Empty => {}
         }
     }
+
+    globals.iter().for_each(|gl| {
+        if let Some(data) = data_define.get_mut(gl) {
+            data.import = true;
+        } else if let Some(fun) = functions.get_mut(gl) {
+            fun.global = true;
+        } else {
+            eprintln!("Error: Global {} not found", gl);
+            std::process::exit(1);
+        }
+    });
 
     elf::generate(out, functions, data_define, exts)
 }
