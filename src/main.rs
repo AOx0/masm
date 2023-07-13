@@ -1,6 +1,3 @@
-#![feature(trait_alias)]
-#![feature(return_position_impl_trait_in_trait)]
-
 //! Basic assembler for x86_64
 //!
 //! References:
@@ -10,7 +7,6 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-
 use std::mem::take;
 use std::str::FromStr;
 use std::{
@@ -22,7 +18,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use faerie::*;
 use num::Bounded;
-
 use target_lexicon::Triple;
 
 mod parser;
@@ -570,9 +565,7 @@ impl IntoBytecode for Symbol {
 impl FromStr for Symbol {
     type Err = anyhow::Error;
     fn from_str(inp: &str) -> Result<Self, Self::Err> {
-        let (_, remain) = parse_name()(inp)?;
-
-        if !remain.is_empty() {
+        if !parse_name(inp)?.is_none() {
             Err(anyhow!("Invalid symbol: {}", inp))
         } else {
             Ok(Symbol {
@@ -831,23 +824,19 @@ impl FromStr for EffectiveAddress {
         if let Some(parts) = part {
             let (index, scale) = parts.split_once('*').unwrap_or((parts, ""));
 
-            if let Ok(index) = Register::from_str(index.trim()) {
+            return if let Ok(index) = Register::from_str(index.trim()) {
                 result.typ = EffectiveAddressType::Else;
                 result.index = index;
                 if !scale.is_empty() {
                     result.scale = Scale::from_str(scale)?;
                 }
-                return Ok(result);
+                Ok(result)
             } else {
                 result.symbol = Some(Symbol::from_str(parts.trim())?);
-                return Ok(result);
-            }
-        } else {
-            return Ok(result);
-        }
-
-        // Try get [base + index * scale + displacement]
-        if let Some(part) = parts.next() {
+                Ok(result)
+            };
+        } else if let Some(part) = parts.next() {
+            // Try get [base + index * scale + displacement]
             if let Ok(displacement) = Displacement::from_str(part.trim()) {
                 result.typ = EffectiveAddressType::Else;
                 result.displacement = displacement;
@@ -1114,23 +1103,30 @@ enum Line {
     Empty,
 }
 
-fn parse_name() -> impl parser::Parser<String> {
+fn parse_name(inp: &str) -> Result<Option<(char, char)>> {
     use parser::*;
-    let parse_name = match_until_err(match_any_of(
-        [
-            CharMatch::Char('_'),
-            CharMatch::CharRange('a'..='z'),
-            CharMatch::CharRange('0'..='9'),
-        ]
-        .to_vec(),
-    ));
-    let parse_space = match_until_err(match_any_of(
-        [CharMatch::Char(' '), CharMatch::Char('\t')].to_vec(),
-    ));
+    let parse_name = match_until_err(match_any_of(&[
+        CharMatch::Char('_'),
+        CharMatch::CharRange('a'..='z'),
+        CharMatch::CharRange('0'..='9'),
+    ]));
 
-    map(and_then(parse_name, parse_space), |(c, r)| {
-        (format!("{:?}", c), r)
-    })
+    let parse_space = match_until_err(match_any_of(&[CharMatch::Char(' '), CharMatch::Char('\t')]));
+
+    let s = map(and_then(parse_name, parse_space), |(_, r)| ((), r))(inp)?
+        .1
+        .trim();
+
+    let mut iter = s.chars();
+
+    let a = iter.next();
+    let b = iter.next().unwrap_or(' ');
+
+    if let (Some(a), b) = (a, b) {
+        Ok(Some((a, b)))
+    } else {
+        Ok(None)
+    }
 }
 
 impl FromStr for Line {
@@ -1151,21 +1147,22 @@ impl FromStr for Line {
             .unwrap_or_else(|| inp)
             .trim_end();
 
-        use parser::*;
-
         let is_definition: for<'a> fn(&'a str) -> Result<bool> = |inp| {
             let inp = inp.trim_start().to_ascii_lowercase();
+            let res = parse_name(&inp)?;
 
-            let (_, rem) = parse_name()(&inp)?;
-            Ok(["db", "dw", "dd", "dq", "dt"]
-                .iter()
-                .any(|s| rem.starts_with(s)))
+            if let Some(('d', b)) = res {
+                Ok(['b', 'w', 'd', 'q', 't'].iter().any(|&s| s == b))
+            } else {
+                return Ok(false);
+            }
         };
 
         let is_function: for<'a> fn(&'a str) -> Result<bool> = |inp: &str| {
             let inp = inp.trim_start();
-            let (_, rem) = parse_name()(inp)?;
-            Ok(rem.trim().starts_with(':'))
+            let res = parse_name(inp.trim())?;
+
+            Ok(matches!(res, Some((':', _))))
         };
 
         let is_definition = is_definition(inp).unwrap_or(false);
@@ -1413,7 +1410,7 @@ impl Fun {
                                     i,
                                     op1,
                                     op2
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1555,7 +1552,7 @@ impl Fun {
                                     i,
                                     op1,
                                     op2
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1623,7 +1620,7 @@ impl Fun {
                                     i,
                                     op1,
                                     op2
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1717,7 +1714,7 @@ impl Fun {
                                     i,
                                     op1,
                                     op2
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1791,7 +1788,7 @@ impl Fun {
                                     i,
                                     op1,
                                     op2
-                                ))
+                                ));
                             }
                         }
                     }
