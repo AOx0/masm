@@ -4,15 +4,6 @@ A simple assembler for x86_64 assembly that generates relocatable ELF files.
 
 ## Install
 
-### Nightly Rust
-
-To install/compile the assembler you need to have rust installed. You can install rust from [here](https://www.rust-lang.org/tools/install).
-The project uses the nightly toolchain, so you may need to install it with:
-
-```bash
-rustup toolchain install nightly
-```
-
 ### Install with Cargo
 
 Clone the repository and run
